@@ -1,0 +1,10 @@
+project_name: cvrank
+selection_name: lambda_rank_best_selection
+base_dir: ../..
+summary_csv: ./data/output/sweeps/lambda_rank/lambda_sweep_summary.csv
+route_config_paths:
+  - ./configs/routes/dbscan.yaml
+  - ./configs/routes/no_cluster.yaml
+  - ./configs/routes/basin.yaml
+output_root: ./data/output/selected_lambda
+train_after_select: false

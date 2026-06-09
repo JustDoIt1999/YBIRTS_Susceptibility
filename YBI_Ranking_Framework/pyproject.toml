@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cvrank"
+version = "0.1.0"
+description = "Rank-aware cross-validation pipeline for QTP RTS susceptibility modeling"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "pandas",
+  "scikit-learn",
+  "pyyaml",
+  "pytest",
+  "torch",
+  "tqdm>=4.67.1",
+  "matplotlib",
+  "seaborn",
+  "plotly",
+]
+
+[project.scripts]
+cvrank = "cvrank.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

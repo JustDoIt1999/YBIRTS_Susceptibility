@@ -1,0 +1,50 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS metadata
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# IDE settings
+.vscode/
+.idea/
+
+# Data processing outputs
+Data_Processing/01_pa_sampling/outputs/
+Data_Processing/02_sample_tables/outputs/
+tmp
+
+# CVRank outputs and artifacts
+CVRank/data/
+CVRank/artifacts/
+
+# Raster Prediction outputs and caches
+Raster_Prediction/output/
+Raster_Prediction/cache/
+
+# Office documents and PDFs
+*.doc
+*.docx
+*.xls
+*.xlsx
+*.pdf
+*.csv
+
+

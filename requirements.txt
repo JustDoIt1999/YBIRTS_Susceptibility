@@ -1,0 +1,33 @@
+# Core Numerical & Data Processing
+numpy==1.26.4
+pandas==2.3.2
+geopandas==1.1.2
+shapely==2.0.7
+scipy==1.16.1
+
+# Machine Learning & Deep Learning
+torch==2.8.0
+scikit-learn==1.8.0
+
+# Visualization & Plotting
+matplotlib==3.10.5
+seaborn==0.13.2
+plotly==6.3.0
+
+# Spatial & Geospatial Data
+rasterio==1.4.3
+earthengine-api==1.7.21
+geemap==0.37.1
+
+# Configuration & Utilities
+pyyaml==6.0.2
+python-dotenv==1.2.2
+tqdm==4.67.1
+
+# Notebook / Interactive Environment
+ipython==9.1.0
+ipywidgets==8.1.8
+ipyleaflet==0.20.0
+
+# Testing
+pytest==9.0.2

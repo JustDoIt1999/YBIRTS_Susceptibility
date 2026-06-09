@@ -1,0 +1,18 @@
+project_name: cvrank
+task: train_validate
+base_dir: ../..
+seed: 42
+epochs: 200
+patience: 15
+batch_size: 256
+lr: 0.001
+weight_decay: 0.00001
+lambda_rank: 0
+rank_loss_mode: ndcg_aware_lambdarank
+threshold: 0.5
+n_splits: 5
+group_col: Sample_ID
+stratify_mode: year_plus_label
+hidden_dims: [128, 64, 32]
+dropout: 0.2
+device: cpu

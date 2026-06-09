@@ -1,0 +1,54 @@
+
+# training config resolution
+model_backend: cvrank
+route: dbscan
+batch_size: 256
+rank_loss_mode: ndcg_aware_lambdarank
+
+# targets
+years:
+  - 2016
+  - 2017
+  - 2018
+  - 2019
+  - 2020
+  - 2021
+  - 2022
+
+# output
+raster_output_dir: ../../output/tif/annual
+json_output_dir: ../../output/json/annual
+output_name_template: "{route}_bs_{batch_size}_RTS_Susceptibility_{year}.tif"
+overwrite: false
+
+# runtime
+tile_size_primary: 512
+tile_size_fallback: 256
+inference_batch_size: null
+ee_endpoint_mode: auto
+device: cpu
+cache_root: ../../cache
+enable_cache: false
+resume: true
+cache_policy: none
+download_workers: 3
+prefetch_queue_size: 3
+show_progress: true
+write_progress_every_n_tiles: 10
+max_tiles: null
+download_retry: 4
+sleep_seconds_between_tiles: 0.0
+nodata_value: -9999.0
+write_uncertainty_outputs: true
+write_confidence_outputs: true
+uncertainty_metrics:
+  - std
+uncertainty_output_subdir: uncertainty
+uncertainty_epsilon: 1.0e-6
+confidence_class_count: 5
+confidence_sampling_per_tile: 4096
+confidence_sample_seed: 42
+confidence_nodata_value: -9999
+
+# execution
+run: false

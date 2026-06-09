@@ -1,0 +1,7 @@
+# Workflow-level defaults for `bash scripts/workflow/run_full_pipeline.sh`
+# Keep nullable values as null when you want the underlying route/lambda configs
+# to use their built-in defaults and keep the legacy untagged output layout.
+
+skip_existing: false
+batch_size: null
+rank_loss_mode: null
