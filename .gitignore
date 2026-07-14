@@ -46,5 +46,20 @@ Raster_Prediction/cache/
 *.xlsx
 *.pdf
 *.csv
+!Dataset_Construction/inputs/positive_samples.csv
 
+# figure and table
+figure/
+table/
 
+# Track curated manuscript figures, source data, notebooks, and tables.
+# !figure/
+# !figure/**
+# !table/
+# !table/**
+# !figure/**/*.csv
+# !figure/**/*.xlsx
+# !figure/**/*.pdf
+# !table/**/*.csv
+# !table/**/*.xlsx
+# !table/**/*.pdf
