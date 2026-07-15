@@ -10,8 +10,10 @@ WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
-from Susceptibility_Mapping import gee_context as ee_ctx
-from Susceptibility_Mapping import projection_engine as engine
+# These imports intentionally follow the workspace-path bootstrap so this file can
+# be run both as a module and directly as a script.
+from Susceptibility_Mapping import gee_context as ee_ctx  # noqa: E402
+from Susceptibility_Mapping import projection_engine as engine  # noqa: E402
 
 
 PREDICTION_ROOT = Path(__file__).resolve().parent
@@ -26,13 +28,13 @@ DEFAULT_JOB = {
     "train_config_path": None,
     "batch_size": None,
     "rank_loss_mode": None,
-    "selection_strategy": None,
+    "train_output_suffix": None,
     "route": None,
     "years": list(SUPPORTED_PREDICTION_YEARS),
     "output_dir": PREDICTION_ROOT / "outputs" / "tif" / "annual",
     "raster_output_dir": PREDICTION_ROOT / "outputs" / "tif" / "annual",
     "json_output_dir": PREDICTION_ROOT / "outputs" / "json" / "annual",
-    "output_name_template": "{model_backend}_{route}_bs_{batch_size}_{selection_strategy}_RTS_Susceptibility_{year}.tif",
+    "output_name_template": "{model_backend}_{route}_bs_{batch_size}_RTS_Susceptibility_{year}.tif",
     "overwrite": False,
     "device": "cpu",
     "tile_size_primary": 128,
@@ -79,7 +81,7 @@ ANNUAL_JOB_CONFIG_ALLOWED_KEYS = {
     "train_config_path",
     "batch_size",
     "rank_loss_mode",
-    "selection_strategy",
+    "train_output_suffix",
     "route",
     "years",
     "output_dir",
@@ -165,34 +167,38 @@ def resolve_annual_download_only_target_identity(job: dict[str, Any]) -> tuple[s
     return "annual_cache", DOWNLOAD_ONLY_OUTPUT_NAME_TEMPLATE
 
 
+def partition_annual_feature_cols(feature_cols: list[str]) -> tuple[list[str], list[str]]:
+    """Split the resolved model inputs into ordered static and dynamic bands."""
+    normalized_feature_cols = [str(column) for column in feature_cols]
+    if not normalized_feature_cols:
+        raise ValueError("feature_cols must contain at least one annual projection feature")
+    if len(normalized_feature_cols) != len(set(normalized_feature_cols)):
+        raise ValueError("feature_cols must not contain duplicate annual projection features")
+    static_feature_names = set(ee_ctx.CURRENT_STATIC_EXPORT_FEATURE_COLS)
+    static_feature_cols = [column for column in normalized_feature_cols if column in static_feature_names]
+    dynamic_feature_cols = [column for column in normalized_feature_cols if column not in static_feature_names]
+    return static_feature_cols, dynamic_feature_cols
+
+
 def build_job_preview(job: dict[str, Any]) -> dict[str, Any]:
     download_only = bool(job.get("download_only", False))
     job = engine.normalize_runtime_job(job if download_only else engine.finalize_train_config(job))
     cfg = {} if download_only else engine.load_training_config(job["train_config_path"], job.get("model_backend"))
-    cfg_selection_meta = engine.describe_config_selection_strategy(cfg) if not download_only else None
     if download_only:
         route = None
         selected_batch_size = None
         selected_rank_loss_mode = None
-        selected_selection_strategy = None
+        feature_cols_preview = list(ee_ctx.CURRENT_RANK_FEATURE_COLS)
         _, output_template = resolve_annual_download_only_target_identity(job)
     else:
         route, selected_batch_size, selected_rank_loss_mode = resolve_annual_model_identity(job, cfg)
-        selected_selection_strategy = cfg_selection_meta["selection_strategy"] or job.get("selection_strategy")
         feature_cols_preview = engine.resolve_training_feature_cols(cfg, route)
         output_template = str(job.get("output_name_template", DEFAULT_JOB["output_name_template"]))
-    selection_strategy_source = None
-    if not download_only:
-        if job.get("train_config_source") == "auto_resolved":
-            selection_strategy_source = job.get("selection_strategy_source")
-        else:
-            selection_strategy_source = cfg_selection_meta["selection_strategy_source"]
     output_names_preview = [
         output_template.format(
             route=route,
             batch_size=selected_batch_size,
             rank_loss_mode=selected_rank_loss_mode,
-            selection_strategy=engine.selection_strategy_output_tag(selected_selection_strategy),
             year=int(year),
             model_backend=str(job.get("model_backend")),
             module=str(job.get("model_backend")),
@@ -208,21 +214,21 @@ def build_job_preview(job: dict[str, Any]) -> dict[str, Any]:
         "model_backend": str(job.get("model_backend")),
         "batch_size_preview": selected_batch_size,
         "rank_loss_mode_preview": selected_rank_loss_mode,
-        "selection_strategy_requested": job.get("selection_strategy_requested"),
-        "selection_strategy_preview": selected_selection_strategy,
-        "selection_strategy_source": selection_strategy_source,
-        "selection_strategy_raw_train_config": None if download_only else cfg_selection_meta["selection_strategy_raw"],
+        "train_output_suffix": job.get("train_output_suffix"),
+        "selection_policy": None if download_only else cfg.get("selection_policy"),
         "train_config_source": str(job.get("train_config_source")),
         "targets_preview": [int(y) for y in job.get("years", list(SUPPORTED_PREDICTION_YEARS))],
         "input_source": PREDICTION_INPUT_SOURCE,
         "supported_prediction_years": list(SUPPORTED_PREDICTION_YEARS),
-        "feature_count_preview": len(ee_ctx.CURRENT_RANK_FEATURE_COLS) if download_only else len(feature_cols_preview),
-        "train_config_path": None if not job.get("train_config_path") else str(engine._as_path(job["train_config_path"])),
+        "feature_count_preview": len(feature_cols_preview),
+        "train_config_path": None
+        if not job.get("train_config_path")
+        else str(engine.resolve_path(job["train_config_path"])),
         "output_dir": str(raster_output_dir),
         "raster_output_dir": str(raster_output_dir),
         "json_output_dir": str(json_output_dir),
         "output_names_preview": output_names_preview,
-        "cache_root": str(engine._as_path(job["cache_root"])),
+        "cache_root": str(engine.resolve_path(job["cache_root"])),
         "enable_cache": bool(job["enable_cache"]),
         "tile_size_primary": int(job["tile_size_primary"]),
         "tile_size_fallback": int(job["tile_size_fallback"]),
@@ -259,27 +265,29 @@ def build_annual_targets(
     route: str | None,
     selected_batch_size: int | None,
     selected_rank_loss_mode: str | None,
-    selected_selection_strategy: str | None,
+    *,
+    feature_cols: list[str],
 ) -> list[dict[str, Any]]:
     runtime_ctx = ee_ctx.get_runtime_context(ee_endpoint_mode=job["ee_endpoint_mode"])
     region = runtime_ctx["region"]
     project_id = ee_ctx.runtime_project_id()
     glacier_fc = ee_ctx.ee.FeatureCollection(f"projects/{project_id}/assets/glacier")
     lake_fc = ee_ctx.ee.FeatureCollection(f"projects/{project_id}/assets/lake")
-    
+
     exclude_mask = ee_ctx.ee.Image.constant(1).paint(glacier_fc, 0).paint(lake_fc, 0)
-    
+
     aoi_mask_image = (
         ee_ctx.ee.Image.constant(1)
         .rename(engine.AUX_MASK_BAND)
         .clip(region)
-        .unmask(0)
+        .unmask(0)  # pyright: ignore[reportArgumentType] -- Earth Engine accepts numeric fill values.
         .multiply(exclude_mask)
     )
     download_only = bool(job.get("download_only", False))
-    feature_cols = list(ee_ctx.CURRENT_RANK_FEATURE_COLS) if download_only else engine.get_route_feature_cols(route)
-    static_feature_cols = list(ee_ctx.CURRENT_STATIC_EXPORT_FEATURE_COLS)
-    dynamic_feature_cols = [col for col in feature_cols if col not in static_feature_cols]
+    if not download_only and route is None:
+        raise ValueError("route is required when building annual inference targets")
+    feature_cols = [str(column) for column in feature_cols]
+    static_feature_cols, dynamic_feature_cols = partition_annual_feature_cols(feature_cols)
     static_stack = ee_ctx.load_static_factor_stack_from_assets().select(static_feature_cols)
     if download_only:
         download_label_prefix, output_template = resolve_annual_download_only_target_identity(job)
@@ -320,7 +328,6 @@ def build_annual_targets(
                     route=route,
                     batch_size=selected_batch_size,
                     rank_loss_mode=selected_rank_loss_mode,
-                    selection_strategy=engine.selection_strategy_output_tag(selected_selection_strategy),
                     year=year,
                     model_backend=str(job.get("model_backend")),
                     module=str(job.get("model_backend")),
@@ -330,7 +337,7 @@ def build_annual_targets(
                     "route": route,
                     "batch_size": selected_batch_size,
                     "rank_loss_mode": selected_rank_loss_mode,
-                    "selection_strategy": selected_selection_strategy,
+                    "selection_policy": None if download_only else job.get("selection_policy"),
                     "year": int(year),
                     "band_name": engine.PREDICTION_RESULT_BAND_NAME,
                     "input_source": PREDICTION_INPUT_SOURCE,
@@ -340,7 +347,7 @@ def build_annual_targets(
                     "route": route,
                     "batch_size": selected_batch_size,
                     "rank_loss_mode": selected_rank_loss_mode,
-                    "selection_strategy": selected_selection_strategy,
+                    "selection_policy": None if download_only else job.get("selection_policy"),
                     "year": int(year),
                     "grid_width": None,
                     "grid_height": None,
@@ -363,19 +370,18 @@ def run_annual_raster_prediction(job: dict[str, Any]) -> list[dict[str, Any]]:
         route = None
         selected_batch_size = None
         selected_rank_loss_mode = None
-        selected_selection_strategy = None
         feature_cols = list(ee_ctx.CURRENT_RANK_FEATURE_COLS)
     else:
         route, selected_batch_size, selected_rank_loss_mode = resolve_annual_model_identity(job, cfg)
-        selected_selection_strategy = engine.resolve_config_selection_strategy(cfg) or job.get("selection_strategy")
         feature_cols = engine.resolve_training_feature_cols(cfg, route)
+        job["selection_policy"] = cfg.get("selection_policy")
     runtime_summary = ee_ctx.build_runtime_summary(ee_endpoint_mode=job["ee_endpoint_mode"])
     targets = build_annual_targets(
         job,
         route,
         selected_batch_size,
         selected_rank_loss_mode,
-        selected_selection_strategy,
+        feature_cols=feature_cols,
     )
     results = engine.run_projection_targets(
         provider_name="annual_projection",
@@ -403,8 +409,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--train-config", type=str, default=None, help="Training config YAML path.")
     parser.add_argument("--batch-size", type=int, default=None, help="Training batch size tag used to resolve train_config_path.")
-    parser.add_argument("--rank-loss-mode", type=str, default=None, help="Training rank loss mode used to resolve train_config_path.")
-    parser.add_argument("--selection-strategy", type=str, default=None, help="Selection strategy used to resolve train_config_path: s1 / s2.")
+    parser.add_argument(
+        "--rank-loss-mode",
+        type=str,
+        default=None,
+        help=(
+            "Training rank loss mode used to resolve train_config_path. "
+            "disabled selects the classification baseline; it disables ranking loss, not model inference."
+        ),
+    )
+    parser.add_argument("--train-output-suffix", type=str, default=None, help="Optional suffix of the selected training output root.")
     parser.add_argument("--route", type=str, default=None, help="Override route.")
     parser.add_argument("--years", type=int, nargs="+", default=None, help=f"Prediction years. Supported values: {list(SUPPORTED_PREDICTION_YEARS)}")
     parser.add_argument("--tile-size-primary", type=int, default=None, help="Primary tile edge length in pixels.")
@@ -498,7 +512,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 def build_job_from_args(args: argparse.Namespace) -> dict[str, Any]:
     job = dict(DEFAULT_JOB)
-    job_config_path = engine._as_path(args.job_config)
+    job_config_path = engine.resolve_path(args.job_config)
     job.update(
         engine.load_projection_job_config(
             job_config_path,
@@ -509,21 +523,21 @@ def build_job_from_args(args: argparse.Namespace) -> dict[str, Any]:
     if args.model_backend not in (None, ""):
         job["model_backend"] = engine.normalize_model_backend(args.model_backend)
     if args.train_config not in (None, ""):
-        job["train_config_path"] = engine._as_path(args.train_config)
+        job["train_config_path"] = engine.resolve_path(args.train_config)
         if args.batch_size is None:
             job["batch_size"] = None
         if args.rank_loss_mode in (None, ""):
             job["rank_loss_mode"] = None
-        if args.selection_strategy in (None, ""):
-            job["selection_strategy"] = None
+        if args.train_output_suffix in (None, ""):
+            job["train_output_suffix"] = None
         if args.route in (None, ""):
             job["route"] = None
     if args.batch_size is not None:
         job["batch_size"] = int(args.batch_size)
     if args.rank_loss_mode not in (None, ""):
         job["rank_loss_mode"] = str(args.rank_loss_mode).strip().lower()
-    if args.selection_strategy not in (None, ""):
-        job["selection_strategy"] = engine.normalize_selection_strategy(args.selection_strategy, allow_none=True)
+    if args.train_output_suffix not in (None, ""):
+        job["train_output_suffix"] = str(args.train_output_suffix).strip()
     if args.route not in (None, ""):
         job["route"] = str(args.route).strip().lower()
     if args.years is not None:
@@ -539,7 +553,7 @@ def build_job_from_args(args: argparse.Namespace) -> dict[str, Any]:
     if args.ee_endpoint_mode not in (None, ""):
         job["ee_endpoint_mode"] = ee_ctx.normalize_ee_endpoint_mode(args.ee_endpoint_mode)
     if args.cache_root not in (None, ""):
-        job["cache_root"] = engine._as_path(args.cache_root)
+        job["cache_root"] = engine.resolve_path(args.cache_root)
     if args.enable_cache is not None:
         job["enable_cache"] = bool(args.enable_cache)
     if args.resume is not None:
@@ -555,13 +569,13 @@ def build_job_from_args(args: argparse.Namespace) -> dict[str, Any]:
     if args.write_progress_every_n_tiles is not None:
         job["write_progress_every_n_tiles"] = int(args.write_progress_every_n_tiles)
     if args.output_dir not in (None, ""):
-        job["output_dir"] = engine._as_path(args.output_dir)
-        job["raster_output_dir"] = engine._as_path(args.output_dir)
+        job["output_dir"] = engine.resolve_path(args.output_dir)
+        job["raster_output_dir"] = engine.resolve_path(args.output_dir)
     if args.raster_output_dir not in (None, ""):
-        job["raster_output_dir"] = engine._as_path(args.raster_output_dir)
+        job["raster_output_dir"] = engine.resolve_path(args.raster_output_dir)
         job["output_dir"] = job["raster_output_dir"]
     if args.json_output_dir not in (None, ""):
-        job["json_output_dir"] = engine._as_path(args.json_output_dir)
+        job["json_output_dir"] = engine.resolve_path(args.json_output_dir)
     if args.output_name_template not in (None, ""):
         job["output_name_template"] = str(args.output_name_template)
     if args.overwrite is not None:
@@ -625,7 +639,7 @@ def build_job_from_args(args: argparse.Namespace) -> dict[str, Any]:
     job["raster_output_dir"] = engine.resolve_raster_output_dir(job, DEFAULT_JOB["raster_output_dir"])
     job["output_dir"] = job["raster_output_dir"]
     job["json_output_dir"] = engine.resolve_json_output_dir(job, DEFAULT_JOB["json_output_dir"])
-    job["cache_root"] = engine._as_path(job["cache_root"])
+    job["cache_root"] = engine.resolve_path(job["cache_root"])
     job["years"] = [int(year) for year in job.get("years", list(SUPPORTED_PREDICTION_YEARS))]
     return job
 
