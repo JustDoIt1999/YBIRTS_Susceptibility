@@ -10,7 +10,12 @@ from contextlib import nullcontext
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
+else:
+    NDArray = Any
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
@@ -23,8 +28,10 @@ if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 if str(CVRANK_SRC) not in sys.path:
     sys.path.insert(0, str(CVRANK_SRC))
-from Susceptibility_Mapping import gee_context as ee_ctx
-from Susceptibility_Mapping.uncertainty_layers import (
+# These imports intentionally follow the workspace-path bootstrap so this module
+# can resolve both repository packages when invoked through a direct script.
+from Susceptibility_Mapping import gee_context as ee_ctx  # noqa: E402
+from Susceptibility_Mapping.uncertainty_layers import (  # noqa: E402
     DEFAULT_UNCERTAINTY_EXPORT_METRICS,
     UNCERTAINTY_METRIC_NAMES,
     classify_by_thresholds,
@@ -34,19 +41,27 @@ from Susceptibility_Mapping.uncertainty_layers import (
     sample_finite_values,
     summarize_prediction_members as summarize_member_prediction_matrix,
 )
+from cvrank.artifact_layout import (  # noqa: E402
+    build_legacy_untagged_batch_train_config_path,
+    build_selected_train_config_path,
+    make_selected_model_identity,
+)
+from cvrank.rank_loss_mode import (  # noqa: E402
+    SUPPORTED_RANK_LOSS_MODES as CVRANK_SUPPORTED_RANK_LOSS_MODES,
+    normalize_rank_loss_mode as normalize_cvrank_rank_loss_mode,
+)
 
-np = None
-pd = None
-rasterio = None
-torch = None
-yaml = None
-CRS = None
-from_origin = None
-Window = None
-tqdm = None
-get_cvrank_selection_strategy = None
-normalize_cvrank_selection_strategy = None
-DEFAULT_SELECTION_STRATEGY = "s2"
+np: Any = None
+pd: Any = None
+rasterio: Any = None
+torch: Any = None
+yaml: Any = None
+crs_factory: Any = None
+from_origin: Any = None
+window_factory: Any = None
+tqdm: Any = None
+TilePreparationResult = tuple[Any, Any, dict[str, Any]]
+TilePreparationFuture = Future[TilePreparationResult]
 MODEL_BACKEND_CVRANK = "cvrank"
 DEFAULT_MODEL_BACKEND = MODEL_BACKEND_CVRANK
 SUPPORTED_MODEL_BACKENDS = {MODEL_BACKEND_CVRANK}
@@ -60,19 +75,18 @@ IN_MEMORY_NODATA_VALUE = -9999.0
 AUX_MASK_BAND = "aoi_mask"
 PREDICTION_RESULT_BAND_NAME = "prediction"
 CONFIDENCE_RESULT_BAND_NAME = "confidence_class"
-SUPPORTED_RANK_LOSS_MODES = {
-    "ranknet",
-    "pairwise_hinge",
-    "ndcg_aware_lambdarank",
-}
+SUPPORTED_RANK_LOSS_MODES = set(CVRANK_SUPPORTED_RANK_LOSS_MODES)
 DEFAULT_CACHE_POLICY = "feature_tiles"
 SUPPORTED_CACHE_POLICIES = {"none", "feature_tiles"}
-RUN_STATE_VERSION = 2
+RUN_STATE_VERSION = 3
+MODEL_BUNDLE_IDENTITY_VERSION = 1
 CACHE_FORMAT_VERSION = 2
 DEFAULT_UNCERTAINTY_OUTPUT_SUBDIR = "uncertainty"
 UNCERTAINTY_BACKFILL_PROGRESS_SUFFIX = "_uncertainty_backfill_progress.json"
 UNCERTAINTY_BACKFILL_FAILED_SUFFIX = "_uncertainty_backfill_failed_tiles.json"
 UNCERTAINTY_BACKFILL_RUNTIME_SUFFIX = "_uncertainty_backfill_runtime_summary.json"
+
+
 def _project_output_root(project_root: str | Path) -> Path:
     return Path(project_root).resolve() / "data" / "output"
 
@@ -92,27 +106,10 @@ def import_yaml_dependency() -> None:
     yaml = _yaml
 
 
-def import_selection_dependencies() -> None:
-    global get_cvrank_selection_strategy, normalize_cvrank_selection_strategy, DEFAULT_SELECTION_STRATEGY
-
-    if get_cvrank_selection_strategy is not None and normalize_cvrank_selection_strategy is not None:
-        return
-    try:
-        from cvrank.selection import DEFAULT_SELECTION_STRATEGY as _DEFAULT_SELECTION_STRATEGY
-        from cvrank.selection import get_selection_strategy as _get_selection_strategy
-        from cvrank.selection import normalize_selection_strategy as _normalize_selection_strategy
-    except ImportError as exc:
-        raise ImportError("Missing cvrank.selection dependency, unable to parse selection_strategy.") from exc
-
-    get_cvrank_selection_strategy = _get_selection_strategy
-    normalize_cvrank_selection_strategy = _normalize_selection_strategy
-    DEFAULT_SELECTION_STRATEGY = str(_DEFAULT_SELECTION_STRATEGY)
-
-
 def import_runtime_dependencies() -> None:
-    global np, pd, rasterio, torch, yaml, CRS, from_origin, Window, tqdm
+    global np, pd, rasterio, torch, crs_factory, from_origin, window_factory, tqdm
 
-    if np is not None and torch is not None:
+    if np is not None:
         return
     try:
         import_yaml_dependency()
@@ -131,17 +128,16 @@ def import_runtime_dependencies() -> None:
     np = _np
     pd = _pd
     rasterio = _rasterio
-    CRS = _CRS
+    crs_factory = _CRS
     from_origin = _from_origin
-    Window = _Window
+    window_factory = _Window
     tqdm = _tqdm
     try:
         import torch as _torch
     except ImportError:
         torch = None
-        return
-
-    torch = _torch
+    else:
+        torch = _torch
 
 
 def normalize_model_backend(value: Any | None) -> str:
@@ -247,62 +243,14 @@ def ensure_inference_dependencies(model_backend: Any | None) -> dict[str, Any]:
     return adapter
 
 
-def normalize_selection_strategy(value: Any | None, *, allow_none: bool = False) -> str | None:
-    if value in (None, ""):
-        return None if allow_none else DEFAULT_SELECTION_STRATEGY
-    import_selection_dependencies()
-    assert normalize_cvrank_selection_strategy is not None
-    return normalize_cvrank_selection_strategy(value)
-
-
-def resolve_config_selection_strategy(config: dict[str, Any] | None) -> str | None:
-    if not isinstance(config, dict):
-        return None
-    value = config.get("selection_strategy")
-    if value in (None, ""):
-        return None
-    try:
-        return normalize_selection_strategy(value, allow_none=True)
-    except ValueError:
-        return None
-
-
-def describe_config_selection_strategy(config: dict[str, Any] | None) -> dict[str, Any]:
-    if not isinstance(config, dict):
-        return {
-            "selection_strategy": None,
-            "selection_strategy_source": "config_unavailable",
-            "selection_strategy_raw": None,
-        }
-
-    raw_value = config.get("selection_strategy")
-    normalized_value = resolve_config_selection_strategy(config)
-    if normalized_value is not None:
-        return {
-            "selection_strategy": normalized_value,
-            "selection_strategy_source": "train_config_metadata",
-            "selection_strategy_raw": raw_value,
-        }
-    if raw_value in (None, ""):
-        return {
-            "selection_strategy": None,
-            "selection_strategy_source": "train_config_metadata_missing",
-            "selection_strategy_raw": None,
-        }
-    return {
-        "selection_strategy": None,
-        "selection_strategy_source": "train_config_metadata_unrecognized",
-        "selection_strategy_raw": str(raw_value),
-    }
-
-
-def selection_strategy_output_tag(value: Any | None) -> str:
-    normalized = normalize_selection_strategy(value, allow_none=True)
-    return normalized if normalized is not None else "legacy"
+def resolve_path(value: str | Path) -> Path:
+    """Return an absolute, user-expanded path for public callers."""
+    return Path(value).expanduser().resolve()
 
 
 def _as_path(value: str | Path) -> Path:
-    return Path(value).expanduser().resolve()
+    """Backward-compatible internal alias for :func:`resolve_path`."""
+    return resolve_path(value)
 
 
 def _resolve_path_from_base(value: str | Path, base_dir: str | Path) -> Path:
@@ -329,11 +277,23 @@ def compute_file_hash(path: str | Path) -> str:
     return hasher.hexdigest()
 
 
-_PROGRESS_DISPLAY_ACTIVE = False
+def describe_model_artifact(path: str | Path) -> dict[str, Any]:
+    resolved_path = _as_path(path)
+    if not resolved_path.is_file():
+        raise FileNotFoundError(f"Required model artifact not found: {resolved_path}")
+    stat = resolved_path.stat()
+    return {
+        "path": str(resolved_path),
+        "size": int(stat.st_size),
+        "sha256": compute_file_hash(resolved_path),
+    }
+
+
+_progress_display_active = False
 
 
 def emit_runtime_event(event: str, **payload: Any) -> None:
-    if _PROGRESS_DISPLAY_ACTIVE and str(event).startswith("tile_"):
+    if _progress_display_active and str(event).startswith("tile_"):
         return
     print(json.dumps({"event": event, **payload}, ensure_ascii=False), flush=True)
 
@@ -350,14 +310,14 @@ class TerminalProgressDisplay:
         self.label = str(label)
         self._previous_active = False
         self._started_at = time.perf_counter()
-        counts = progress_counts(manifest)
+        counts = output_progress_counts(manifest)
         self._initial_done = int(counts.get("done", 0))
         self.total_bar = None
         self.fetch_bar = None
         if not self.enabled:
             return
         import_runtime_dependencies()
-        total = len(manifest.get("tile_order", []))
+        total = len(output_leaf_tile_ids(manifest))
         fetched = self._fetched_count(counts)
         self.total_bar = tqdm(
             total=total,
@@ -384,23 +344,23 @@ class TerminalProgressDisplay:
         return int(counts.get("downloaded", 0)) + int(counts.get("inferring", 0)) + int(counts.get("done", 0))
 
     def __enter__(self) -> "TerminalProgressDisplay":
-        global _PROGRESS_DISPLAY_ACTIVE
-        self._previous_active = _PROGRESS_DISPLAY_ACTIVE
+        global _progress_display_active
+        self._previous_active = _progress_display_active
         if self.enabled:
-            _PROGRESS_DISPLAY_ACTIVE = True
+            _progress_display_active = True
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        global _PROGRESS_DISPLAY_ACTIVE
+        global _progress_display_active
         if self.enabled:
             self.close()
-        _PROGRESS_DISPLAY_ACTIVE = self._previous_active
+        _progress_display_active = self._previous_active
 
     def update_from_manifest(self, manifest: dict[str, Any], *, force: bool = False) -> None:
         if not self.enabled or self.total_bar is None or self.fetch_bar is None:
             return
-        counts = progress_counts(manifest)
-        total = len(manifest.get("tile_order", []))
+        counts = output_progress_counts(manifest)
+        total = len(output_leaf_tile_ids(manifest))
         fetched = min(total, self._fetched_count(counts))
         done = min(total, int(counts.get("done", 0)))
         if force or self.total_bar.total != total:
@@ -604,14 +564,9 @@ def build_uncertainty_output_paths(
 
 
 def normalize_rank_loss_mode(rank_loss_mode: str | None) -> str:
-    value = str(rank_loss_mode or "").strip().lower()
-    if not value:
+    if not str(rank_loss_mode or "").strip():
         raise ValueError("rank_loss_mode cannot be empty; please specify it explicitly in the job YAML or CLI.")
-    if value not in SUPPORTED_RANK_LOSS_MODES:
-        raise ValueError(
-            f"Unsupported rank_loss_mode: {rank_loss_mode}; supported={sorted(SUPPORTED_RANK_LOSS_MODES)}"
-        )
-    return value
+    return normalize_cvrank_rank_loss_mode(rank_loss_mode)
 
 
 def normalize_training_batch_size(batch_size: int | str | None) -> int:
@@ -628,18 +583,59 @@ def build_selected_train_config_candidate_path(
     route: str,
     batch_size: int,
     rank_loss_mode: str,
-    selection_strategy: str | None,
+    train_output_suffix: str | None = None,
 ) -> Path:
-    root = CVRANK_OUTPUT_ROOT
-    root = (
-        root
-        / f"output_{route}_selected"
-        / f"bs_{batch_size}"
-        / rank_loss_mode
+    identity = make_selected_model_identity(
+        route=route,
+        batch_size=batch_size,
+        rank_loss_mode=rank_loss_mode,
+        train_output_suffix=train_output_suffix,
     )
-    if selection_strategy is not None:
-        root = root / selection_strategy
-    return (root / "selection" / f"{route}_best_train.yaml").resolve()
+    return build_selected_train_config_path(CVRANK_OUTPUT_ROOT, identity).resolve()
+
+
+def validate_selected_train_config_identity(
+    config_path: Path,
+    *,
+    route: str,
+    batch_size: int,
+    rank_loss_mode: str,
+    train_output_suffix: str | None,
+) -> dict[str, Any]:
+    import_yaml_dependency()
+    with config_path.open("r", encoding="utf-8") as fh:
+        config = yaml.safe_load(fh) or {}
+    if not isinstance(config, dict):
+        raise ValueError(f"Selected train config must be a YAML mapping: {config_path}")
+
+    actual_route = str(config.get("route") or "").strip().lower()
+    actual_batch_size = normalize_training_batch_size(config.get("batch_size"))
+    actual_rank_loss_mode = normalize_rank_loss_mode(config.get("rank_loss_mode"))
+    actual_suffix = config.get("output_suffix")
+    requested_identity = make_selected_model_identity(
+        route=route,
+        batch_size=batch_size,
+        rank_loss_mode=rank_loss_mode,
+        train_output_suffix=train_output_suffix,
+    )
+    actual_identity = make_selected_model_identity(
+        route=actual_route,
+        batch_size=actual_batch_size,
+        rank_loss_mode=actual_rank_loss_mode,
+        train_output_suffix=actual_suffix,
+    )
+    if actual_identity != requested_identity:
+        raise ValueError(
+            "Selected train config identity mismatch.\n"
+            f"requested={requested_identity.as_dict()}\n"
+            f"resolved={actual_identity.as_dict()}\n"
+            f"path={config_path}"
+        )
+    return {
+        "artifact_identity": requested_identity.as_dict(),
+        "artifact_layout_version": config.get("artifact_layout_version"),
+        "selection_policy": config.get("selection_policy"),
+    }
 
 
 def resolve_selected_train_config(
@@ -647,72 +643,48 @@ def resolve_selected_train_config(
     route: str | None,
     batch_size: int | str | None,
     rank_loss_mode: str | None,
-    selection_strategy: Any | None = None,
+    train_output_suffix: str | None = None,
 ) -> dict[str, Any]:
     normalized_route = str(route or "").strip().lower()
     if normalized_route not in RANK_ROUTES:
         raise ValueError(f"Unsupported route for train config resolution: {route}; supported={sorted(RANK_ROUTES)}")
     normalized_batch_size = normalize_training_batch_size(batch_size)
     normalized_rank_loss_mode = normalize_rank_loss_mode(rank_loss_mode)
-    requested_strategy = normalize_selection_strategy(selection_strategy, allow_none=True)
-    candidates: list[tuple[str | None, str, Path]] = []
-    if requested_strategy is not None:
-        candidates.append(
-            (
-                requested_strategy,
-                "requested",
-                build_selected_train_config_candidate_path(
-                    route=normalized_route,
-                    batch_size=normalized_batch_size,
-                    rank_loss_mode=normalized_rank_loss_mode,
-                    selection_strategy=requested_strategy,
-                ),
-            )
+    identity = make_selected_model_identity(
+        route=normalized_route,
+        batch_size=normalized_batch_size,
+        rank_loss_mode=normalized_rank_loss_mode,
+        train_output_suffix=train_output_suffix,
+    )
+    canonical_path = build_selected_train_config_path(CVRANK_OUTPUT_ROOT, identity).resolve()
+    legacy_path = build_legacy_untagged_batch_train_config_path(CVRANK_OUTPUT_ROOT, identity).resolve()
+    candidates = (
+        ("canonical", canonical_path),
+        ("legacy_untagged_batch", legacy_path),
+    )
+    for artifact_layout, config_path in candidates:
+        if not config_path.exists():
+            continue
+        identity_metadata = validate_selected_train_config_identity(
+            config_path,
+            route=normalized_route,
+            batch_size=normalized_batch_size,
+            rank_loss_mode=normalized_rank_loss_mode,
+            train_output_suffix=train_output_suffix,
         )
-    else:
-        candidates.append(
-            (
-                DEFAULT_SELECTION_STRATEGY,
-                "default",
-                build_selected_train_config_candidate_path(
-                    route=normalized_route,
-                    batch_size=normalized_batch_size,
-                    rank_loss_mode=normalized_rank_loss_mode,
-                    selection_strategy=DEFAULT_SELECTION_STRATEGY,
-                ),
-            )
-        )
-        candidates.append(
-            (
-                None,
-                "legacy_fallback",
-                build_selected_train_config_candidate_path(
-                    route=normalized_route,
-                    batch_size=normalized_batch_size,
-                    rank_loss_mode=normalized_rank_loss_mode,
-                    selection_strategy=None,
-                ),
-            )
-        )
+        return {
+            "train_config_path": config_path,
+            "artifact_layout": artifact_layout,
+            **identity_metadata,
+        }
 
-    for resolved_strategy, source, config_path in candidates:
-        if config_path.exists():
-            return {
-                "train_config_path": config_path,
-                "selection_strategy": resolved_strategy,
-                "selection_strategy_requested": requested_strategy,
-                "selection_strategy_source": source,
-            }
-
-    expected_candidates = [str(candidate_path) for _strategy, _source, candidate_path in candidates]
     raise FileNotFoundError(
         "No matching training configuration found.\n"
         f"route={normalized_route}\n"
         f"batch_size={normalized_batch_size}\n"
         f"rank_loss_mode={normalized_rank_loss_mode}\n"
-        f"selection_strategy_requested={requested_strategy}\n"
-        f"selection_strategy_default={DEFAULT_SELECTION_STRATEGY}\n"
-        f"expected_candidates={expected_candidates}"
+        f"train_output_suffix={identity.train_output_suffix}\n"
+        f"expected_candidates={[str(path) for _layout, path in candidates]}"
     )
 
 
@@ -721,13 +693,13 @@ def resolve_selected_train_config_path(
     route: str | None,
     batch_size: int | str | None,
     rank_loss_mode: str | None,
-    selection_strategy: Any | None = None,
+    train_output_suffix: str | None = None,
 ) -> Path:
     resolved = resolve_selected_train_config(
         route=route,
         batch_size=batch_size,
         rank_loss_mode=rank_loss_mode,
-        selection_strategy=selection_strategy,
+        train_output_suffix=train_output_suffix,
     )
     return resolved["train_config_path"]
 
@@ -742,13 +714,14 @@ def finalize_train_config(job: dict[str, Any]) -> dict[str, Any]:
             route=resolved.get("route"),
             batch_size=resolved.get("batch_size"),
             rank_loss_mode=resolved.get("rank_loss_mode"),
-            selection_strategy=resolved.get("selection_strategy"),
+            train_output_suffix=resolved.get("train_output_suffix"),
         )
         resolved["train_config_path"] = resolved_train_config["train_config_path"]
         resolved["train_config_source"] = "auto_resolved"
-        resolved["selection_strategy"] = resolved_train_config["selection_strategy"]
-        resolved["selection_strategy_requested"] = resolved_train_config["selection_strategy_requested"]
-        resolved["selection_strategy_source"] = resolved_train_config["selection_strategy_source"]
+        resolved["artifact_layout"] = resolved_train_config["artifact_layout"]
+        resolved["artifact_layout_version"] = resolved_train_config.get("artifact_layout_version")
+        resolved["artifact_identity"] = resolved_train_config["artifact_identity"]
+        resolved["selection_policy"] = resolved_train_config.get("selection_policy")
     else:
         resolved["train_config_path"] = normalize_explicit_train_config_path(
             resolved["train_config_path"],
@@ -829,14 +802,11 @@ def _load_optional_feature_preparation_artifact(
     return backend_adapter["load_feature_preparation_artifact"](artifact_path), artifact_path
 
 
-def load_model_scaler_members(
+def resolve_model_member_artifacts(
     cfg: dict[str, Any],
-    feature_cols: list[str],
-    device: Any,
     *,
     backend_adapter: dict[str, Any],
-) -> list[dict[str, Any]]:
-    import_runtime_dependencies()
+) -> tuple[list[dict[str, Any]], Path | None]:
     manifest_path = resolve_cfg_path(cfg, "fold_runs_manifest_path")
     members_meta: list[dict[str, Any]] = []
     if manifest_path is not None and manifest_path.exists():
@@ -854,26 +824,101 @@ def load_model_scaler_members(
                     ),
                 }
             )
+        if not members_meta:
+            raise ValueError(f"Fold runs manifest contains no model members: {manifest_path}")
+        return members_meta, manifest_path
+
+    model_path = resolve_cfg_path(cfg, "model_path")
+    scaler_path = resolve_cfg_path(cfg, "scaler_path")
+    if model_path is None or scaler_path is None:
+        raise ValueError("The selected config must provide model_path and scaler_path.")
+    configured_feature_preparation_path = resolve_cfg_path(cfg, "feature_preparation_path")
+    default_artifact_path = _as_path(backend_adapter["default_feature_preparation_path"](cfg))
+    if configured_feature_preparation_path is not None:
+        feature_preparation_path = configured_feature_preparation_path
+    elif default_artifact_path.exists():
+        feature_preparation_path = default_artifact_path
     else:
-        model_path = resolve_cfg_path(cfg, "model_path")
-        scaler_path = resolve_cfg_path(cfg, "scaler_path")
-        if model_path is None or scaler_path is None:
-            raise ValueError("The selected config must provide model_path and scaler_path.")
-        configured_feature_preparation_path = resolve_cfg_path(cfg, "feature_preparation_path")
-        default_artifact_path = _as_path(backend_adapter["default_feature_preparation_path"](cfg))
-        if configured_feature_preparation_path is not None:
-            feature_preparation_path = configured_feature_preparation_path
-        elif default_artifact_path.exists():
-            feature_preparation_path = default_artifact_path
-        else:
-            feature_preparation_path = None
-        members_meta.append(
+        feature_preparation_path = None
+    members_meta.append(
+        {
+            "fold_index": None,
+            "model_path": model_path,
+            "scaler_path": scaler_path,
+            "feature_preparation_path": feature_preparation_path,
+        }
+    )
+    return members_meta, None
+
+
+def build_model_bundle_identity(
+    *,
+    train_config_path: str | Path,
+    model_backend: Any,
+    members_meta: list[dict[str, Any]],
+    fold_manifest_path: str | Path | None,
+) -> dict[str, Any]:
+    members: list[dict[str, Any]] = []
+    for position, meta in enumerate(members_meta):
+        feature_preparation_path = meta.get("feature_preparation_path")
+        members.append(
             {
-                "fold_index": None,
-                "model_path": model_path,
-                "scaler_path": scaler_path,
-                "feature_preparation_path": feature_preparation_path,
+                "position": int(position),
+                "fold_index": meta.get("fold_index"),
+                "model": describe_model_artifact(meta["model_path"]),
+                "scaler": describe_model_artifact(meta["scaler_path"]),
+                "feature_preparation": (
+                    None
+                    if feature_preparation_path in (None, "")
+                    else describe_model_artifact(feature_preparation_path)
+                ),
             }
+        )
+    payload = {
+        "schema_version": MODEL_BUNDLE_IDENTITY_VERSION,
+        "model_backend": normalize_model_backend(model_backend),
+        "train_config": describe_model_artifact(train_config_path),
+        "fold_manifest": (
+            None if fold_manifest_path is None else describe_model_artifact(fold_manifest_path)
+        ),
+        "members": members,
+    }
+    return {**payload, "bundle_hash": compute_payload_hash(payload)}
+
+
+def verify_model_bundle_unchanged(
+    identity: dict[str, Any],
+    *,
+    train_config_path: str | Path,
+    model_backend: Any,
+    members_meta: list[dict[str, Any]],
+    fold_manifest_path: str | Path | None,
+) -> None:
+    current = build_model_bundle_identity(
+        train_config_path=train_config_path,
+        model_backend=model_backend,
+        members_meta=members_meta,
+        fold_manifest_path=fold_manifest_path,
+    )
+    if current["bundle_hash"] != identity["bundle_hash"]:
+        raise RuntimeError(
+            "Model artifacts changed while projection was loading them. Stop concurrent training or artifact replacement, then retry."
+        )
+
+
+def load_model_scaler_members(
+    cfg: dict[str, Any],
+    feature_cols: list[str],
+    device: Any,
+    *,
+    backend_adapter: dict[str, Any],
+    members_meta: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    import_runtime_dependencies()
+    if members_meta is None:
+        members_meta, _manifest_path = resolve_model_member_artifacts(
+            cfg,
+            backend_adapter=backend_adapter,
         )
 
     members: list[dict[str, Any]] = []
@@ -971,7 +1016,7 @@ def build_active_tile_lookup(
         .rename(mask_band)
         .setDefaultProjection(crs=ee_ctx.TARGET_PROJECTION_WKT, scale=ee_ctx.TARGET_SCALE)
         .clip(region_geom)
-        .unmask(0)
+        .unmask(0)  # pyright: ignore[reportArgumentType] -- Earth Engine accepts numeric fill values.
         .reduceResolution(
             reducer=ee_ctx.ee.Reducer.max(),
             bestEffort=True,
@@ -1002,7 +1047,9 @@ def build_active_tile_lookup(
     last_error = None
     for attempt in range(1, int(retry) + 1):
         try:
-            struct_array = ee_ctx.ee.data.computePixels(request)
+            struct_array = ee_ctx.ee.data.computePixels(  # pyright: ignore[reportPrivateImportUsage]
+                request
+            )
             mask_array = np.asarray(struct_array[mask_band], dtype=np.float32)
             expected_shape = (tile_rows, tile_cols)
             if mask_array.shape != expected_shape:
@@ -1128,7 +1175,9 @@ def download_tile_array(image, tile: dict[str, Any], band_ids: list[str], retry:
     last_error = None
     for attempt in range(1, int(retry) + 1):
         try:
-            struct_array = ee_ctx.ee.data.computePixels(request)
+            struct_array = ee_ctx.ee.data.computePixels(  # pyright: ignore[reportPrivateImportUsage]
+                request
+            )
             array = np.dstack([struct_array[band] for band in band_ids]).astype(np.float32, copy=False)
             expected_shape = (int(tile["height"]), int(tile["width"]), len(band_ids))
             if array.shape != expected_shape:
@@ -1169,8 +1218,8 @@ def predict_probability_block(
     if (~base_invalid_flat_mask).sum() == 0:
         return empty_blocks, {"valid_pixels": 0}
 
-    member_predictions: list[np.ndarray] = []
-    valid_flat_mask: np.ndarray | None = None
+    member_predictions: list[NDArray[Any]] = []
+    valid_flat_mask: NDArray[Any] | None = None
     batch_size = max(1, int(inference_batch_size))
 
     for member in model_members:
@@ -1221,7 +1270,7 @@ def predict_probability_block(
             continue
 
         x_scaled = member["scaler"].transform(x_valid)
-        fold_predictions: list[np.ndarray] = []
+        fold_predictions: list[NDArray[Any]] = []
         for start in range(0, valid_count, batch_size):
             stop = min(start + batch_size, valid_count)
             batch_tensor = torch.tensor(x_scaled[start:stop], dtype=torch.float32, device=device)
@@ -1383,7 +1432,7 @@ def build_progress_manifest(
     static_dataset_cache_key: str,
     dynamic_dataset_cache_key: str,
     run_config_hash: str,
-    train_config_hash: str,
+    model_bundle_identity: dict[str, Any],
     primary_tiles: list[dict[str, Any]],
     job: dict[str, Any],
 ) -> dict[str, Any]:
@@ -1399,7 +1448,8 @@ def build_progress_manifest(
         "static_dataset_cache_key": static_dataset_cache_key,
         "dynamic_dataset_cache_key": dynamic_dataset_cache_key,
         "run_config_hash": run_config_hash,
-        "train_config_hash": train_config_hash,
+        "model_bundle_hash": model_bundle_identity["bundle_hash"],
+        "model_bundle_identity": model_bundle_identity,
         "cache_policy": job["cache_policy"],
         "tile_size_primary": int(job["tile_size_primary"]),
         "tile_size_fallback": int(job["tile_size_fallback"]),
@@ -1427,18 +1477,94 @@ def progress_counts(manifest: dict[str, Any]) -> dict[str, int]:
     return counts
 
 
+def manifest_parent_tile_ids(manifest: dict[str, Any]) -> set[str]:
+    tiles = manifest.get("tiles", {})
+    if not isinstance(tiles, dict):
+        return set()
+    return {
+        str(state.get("parent_tile_id"))
+        for state in tiles.values()
+        if isinstance(state, dict)
+        and state.get("parent_tile_id") not in (None, "")
+        and str(state.get("parent_tile_id")) in tiles
+    }
+
+
+def output_leaf_tile_ids(manifest: dict[str, Any]) -> list[str]:
+    tiles = manifest.get("tiles", {})
+    if not isinstance(tiles, dict):
+        return []
+    parent_ids = manifest_parent_tile_ids(manifest)
+    ordered_ids: list[str] = []
+    seen: set[str] = set()
+    for raw_tile_id in manifest.get("tile_order", []):
+        tile_key = str(raw_tile_id)
+        if tile_key in tiles and tile_key not in parent_ids and tile_key not in seen:
+            ordered_ids.append(tile_key)
+            seen.add(tile_key)
+    for raw_tile_id in tiles:
+        tile_key = str(raw_tile_id)
+        if tile_key not in parent_ids and tile_key not in seen:
+            ordered_ids.append(tile_key)
+            seen.add(tile_key)
+    return ordered_ids
+
+
+def output_progress_counts(manifest: dict[str, Any]) -> dict[str, int]:
+    counts = {
+        "pending": 0,
+        "downloading": 0,
+        "downloaded": 0,
+        "inferring": 0,
+        "done": 0,
+        "failed": 0,
+    }
+    tiles = manifest.get("tiles", {})
+    for tile_key in output_leaf_tile_ids(manifest):
+        state = tiles.get(tile_key, {})
+        status = str(state.get("status") or "pending")
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def manifest_output_complete(manifest: dict[str, Any]) -> bool:
+    tiles = manifest.get("tiles", {})
+    if not isinstance(tiles, dict):
+        return False
+    parent_ids = manifest_parent_tile_ids(manifest)
+    parents_complete = all(
+        str(tiles.get(tile_key, {}).get("status")) == "fallback_expanded"
+        for tile_key in parent_ids
+    )
+    leaves_complete = all(
+        str(tiles.get(tile_key, {}).get("status")) == "done"
+        for tile_key in output_leaf_tile_ids(manifest)
+    )
+    return parents_complete and leaves_complete
+
+
 def save_progress_manifest(path: Path, manifest: dict[str, Any]) -> None:
     manifest["updated_at"] = utc_now_iso()
     manifest["progress_counts"] = progress_counts(manifest)
     save_json(path, manifest)
 
 
-def reset_manifest_for_restart(manifest: dict[str, Any]) -> dict[str, Any]:
+def reset_manifest_for_missing_output(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Requeue every output-writing leaf while preserving fallback topology and feature caches."""
     updated = json.loads(json.dumps(manifest))
-    for state in updated.get("tiles", {}).values():
-        status = str(state.get("status") or "pending")
-        if status in {"failed", "downloading", "downloaded", "inferring"}:
-            state["status"] = "pending"
+    reset_at = utc_now_iso()
+    parent_ids = manifest_parent_tile_ids(updated)
+    reset_leaf_count = 0
+    preserved_parent_count = 0
+    for tile_key, state in updated.get("tiles", {}).items():
+        if str(tile_key) in parent_ids:
+            state["status"] = "fallback_expanded"
+            state["error"] = None
+            state["status_updated_at"] = reset_at
+            preserved_parent_count += 1
+            continue
+        state["status"] = "pending"
+        state["attempt_count"] = 0
         state["error"] = None
         state["stats"] = None
         state["started_at"] = None
@@ -1446,13 +1572,27 @@ def reset_manifest_for_restart(manifest: dict[str, Any]) -> dict[str, Any]:
         state["download_completed_at"] = None
         state["inference_started_at"] = None
         state["completed_at"] = None
-        state["status_updated_at"] = utc_now_iso()
-        state["stats"] = None
-        state["cache_path"] = None
-        state["static_cache_path"] = None
-        state["dynamic_cache_path"] = None
-    updated["updated_at"] = utc_now_iso()
+        state["status_updated_at"] = reset_at
+        reset_leaf_count += 1
+    restart_event = {
+        "reason": "output_missing",
+        "reset_at": reset_at,
+        "reset_leaf_tile_count": reset_leaf_count,
+        "preserved_fallback_parent_count": preserved_parent_count,
+    }
+    restart_history = updated.get("restart_history")
+    if not isinstance(restart_history, list):
+        restart_history = []
+    restart_history.append(restart_event)
+    updated["restart_history"] = restart_history
+    updated["last_restart"] = restart_event
+    updated["updated_at"] = reset_at
     return updated
+
+
+def reset_manifest_for_restart(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Backward-compatible alias for the output-missing restart behavior."""
+    return reset_manifest_for_missing_output(manifest)
 
 
 def load_existing_manifest(path: Path) -> dict[str, Any] | None:
@@ -1471,7 +1611,7 @@ def prepare_progress_manifest(
     static_dataset_cache_key: str,
     dynamic_dataset_cache_key: str,
     run_config_hash: str,
-    train_config_hash: str,
+    model_bundle_identity: dict[str, Any],
     primary_tiles: list[dict[str, Any]],
     job: dict[str, Any],
 ) -> tuple[dict[str, Any], str]:
@@ -1486,17 +1626,31 @@ def prepare_progress_manifest(
             static_dataset_cache_key=static_dataset_cache_key,
             dynamic_dataset_cache_key=dynamic_dataset_cache_key,
             run_config_hash=run_config_hash,
-            train_config_hash=train_config_hash,
+            model_bundle_identity=model_bundle_identity,
             primary_tiles=primary_tiles,
             job=job,
         )
         save_progress_manifest(manifest_path, manifest)
         return manifest, "new"
 
-    if existing.get("run_config_hash") != run_config_hash:
+    expected_bundle_hash = model_bundle_identity["bundle_hash"]
+    existing_bundle_hash = existing.get("model_bundle_hash")
+    legacy_model_identity = not download_only and existing_bundle_hash in (None, "")
+    model_bundle_changed = not download_only and existing_bundle_hash != expected_bundle_hash
+    if existing.get("run_config_hash") != run_config_hash or legacy_model_identity or model_bundle_changed:
         if not bool(job.get("overwrite", False)):
+            reason = (
+                "the existing manifest predates model-bundle verification"
+                if legacy_model_identity
+                else (
+                    "the model checkpoint, scaler, preprocessing artifact, or fold manifest has changed"
+                    if model_bundle_changed
+                    else "the projection configuration has changed"
+                )
+            )
             raise RuntimeError(
-                "An existing progress manifest was detected, but the configuration hash has changed. To avoid incorrect recovery, please explicitly pass --overwrite or switch the cache version."
+                f"Cannot safely resume because {reason}. Existing pixels may come from different model artifacts. "
+                "Please explicitly pass --overwrite to rebuild all output pixels; downloaded feature caches can still be reused."
             )
         manifest = build_progress_manifest(
             provider_name=provider_name,
@@ -1506,7 +1660,7 @@ def prepare_progress_manifest(
             static_dataset_cache_key=static_dataset_cache_key,
             dynamic_dataset_cache_key=dynamic_dataset_cache_key,
             run_config_hash=run_config_hash,
-            train_config_hash=train_config_hash,
+            model_bundle_identity=model_bundle_identity,
             primary_tiles=primary_tiles,
             job=job,
         )
@@ -1522,7 +1676,7 @@ def prepare_progress_manifest(
             static_dataset_cache_key=static_dataset_cache_key,
             dynamic_dataset_cache_key=dynamic_dataset_cache_key,
             run_config_hash=run_config_hash,
-            train_config_hash=train_config_hash,
+            model_bundle_identity=model_bundle_identity,
             primary_tiles=primary_tiles,
             job=job,
         )
@@ -1535,7 +1689,7 @@ def prepare_progress_manifest(
         return existing, "resume"
 
     if not output_path.exists():
-        manifest = reset_manifest_for_restart(existing)
+        manifest = reset_manifest_for_missing_output(existing)
         save_progress_manifest(manifest_path, manifest)
         return manifest, "output_missing_reset"
 
@@ -1605,7 +1759,7 @@ def build_run_config_hash(
     dataset_cache_key: str,
     static_dataset_cache_key: str,
     dynamic_dataset_cache_key: str,
-    train_config_hash: str,
+    model_bundle_hash: str,
     job: dict[str, Any],
     provider_name: str,
     output_path: Path,
@@ -1615,7 +1769,7 @@ def build_run_config_hash(
         "dataset_cache_key": dataset_cache_key,
         "static_dataset_cache_key": static_dataset_cache_key,
         "dynamic_dataset_cache_key": dynamic_dataset_cache_key,
-        "train_config_hash": train_config_hash,
+        "model_bundle_hash": model_bundle_hash,
         "model_backend": normalize_model_backend(job.get("model_backend")),
         "provider_name": provider_name,
         "output_path": str(output_path),
@@ -1728,7 +1882,7 @@ def collect_metric_samples_from_rasters(
     manifest: dict[str, Any],
     target_sample_size: int,
     seed: int,
-) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+) -> tuple[dict[str, NDArray[Any]], dict[str, Any]]:
     import_runtime_dependencies()
     target_sample_size = max(1, int(target_sample_size))
     rng = np.random.default_rng(int(seed))
@@ -1740,11 +1894,16 @@ def collect_metric_samples_from_rasters(
     total_pixel_count = sum(int(tile["width"]) * int(tile["height"]) for tile in done_tiles)
     sampling_step = max(1, int(math.ceil(math.sqrt(max(1, total_pixel_count) / float(target_sample_size)))))
     skip_factor = sampling_step - 1
-    mean_samples: list[np.ndarray] = []
-    std_samples: list[np.ndarray] = []
+    mean_samples: list[NDArray[Any]] = []
+    std_samples: list[NDArray[Any]] = []
     with rasterio.open(mean_path) as mean_src, rasterio.open(std_path) as std_src:
         for tile in done_tiles:
-            window = Window(int(tile["col_off"]), int(tile["row_off"]), int(tile["width"]), int(tile["height"]))
+            window = window_factory(
+                int(tile["col_off"]),
+                int(tile["row_off"]),
+                int(tile["width"]),
+                int(tile["height"]),
+            )
             mean_block = mean_src.read(1, window=window)
             std_block = std_src.read(1, window=window)
             mean_nodata = mean_src.nodata
@@ -1893,7 +2052,12 @@ def build_confidence_raster(
                 if str(state.get("status")) != "done":
                     continue
                 tile = state["tile"]
-                window = Window(int(tile["col_off"]), int(tile["row_off"]), int(tile["width"]), int(tile["height"]))
+                window = window_factory(
+                    int(tile["col_off"]),
+                    int(tile["row_off"]),
+                    int(tile["width"]),
+                    int(tile["height"]),
+                )
                 mean_block = mean_src.read(1, window=window)
                 std_block = std_src.read(1, window=window)
                 valid_mask = np.isfinite(mean_block) & np.isfinite(std_block)
@@ -2218,7 +2382,7 @@ def submit_tile_prepare_task(
     dynamic_cache_path: Path,
     cache_policy: str,
     download_retry: int,
-) -> Future:
+) -> TilePreparationFuture:
     return executor.submit(
         prepare_tile_data,
         target=target,
@@ -2234,7 +2398,7 @@ def submit_tile_prepare_task(
 def fill_prefetch_window(
     *,
     executor: ThreadPoolExecutor,
-    pending_futures: dict[str, Future],
+    pending_futures: dict[str, TilePreparationFuture],
     manifest: dict[str, Any],
     manifest_path: Path,
     start_index: int,
@@ -2320,12 +2484,15 @@ def run_projection_target(
     device: Any,
     device_meta: dict[str, Any],
     model_members: list[dict[str, Any]],
+    model_bundle_identity: dict[str, Any],
     backend_adapter: dict[str, Any] | None,
     runtime_summary: dict[str, Any],
     grid_summary: dict[str, Any],
 ) -> dict[str, Any]:
     import_runtime_dependencies()
     download_only = bool(job.get("download_only", False))
+    if not download_only and backend_adapter is None:
+        raise RuntimeError("Inference mode requires a resolved model backend adapter.")
     output_path = raster_output_dir / target["output_name"]
     output_stem = output_path.stem
     uncertainty_enabled = bool(not download_only and should_write_uncertainty_outputs(job, model_members))
@@ -2348,7 +2515,8 @@ def run_projection_target(
     if uncertainty_enabled:
         uncertainty_output_paths["raster_dir"].mkdir(parents=True, exist_ok=True)
         uncertainty_output_paths["json_dir"].mkdir(parents=True, exist_ok=True)
-    manifest_path = json_output_dir / f"{output_stem}_progress.json"
+    primary_manifest_path = json_output_dir / f"{output_stem}_progress.json"
+    manifest_path = primary_manifest_path
     failed_tiles_path = json_output_dir / f"{output_stem}_failed_tiles.json"
     runtime_summary_path = json_output_dir / f"{output_stem}_runtime_summary.json"
     if backfill_uncertainty_only:
@@ -2360,8 +2528,16 @@ def run_projection_target(
                 "backfill_uncertainty_only=true requires an existing primary mean raster; "
                 f"missing={output_path}"
             )
+        primary_manifest = load_existing_manifest(primary_manifest_path)
+        if primary_manifest is None:
+            raise RuntimeError(
+                "Cannot verify backfill_uncertainty_only against the primary mean raster because its progress manifest is missing. Rebuild the projection with --overwrite."
+            )
+        if primary_manifest.get("model_bundle_hash") != model_bundle_identity["bundle_hash"]:
+            raise RuntimeError(
+                "Cannot backfill uncertainty because the primary mean raster was not verified with the current model bundle. Rebuild the full projection with --overwrite."
+            )
 
-    train_config_hash = "download_only" if download_only else compute_file_hash(job["train_config_path"])
     static_dataset_cache_key = build_component_dataset_cache_key(
         target=target,
         feature_cols=target["static_feature_cols"],
@@ -2391,7 +2567,7 @@ def run_projection_target(
         dataset_cache_key=dataset_cache_key,
         static_dataset_cache_key=static_dataset_cache_key,
         dynamic_dataset_cache_key=dynamic_dataset_cache_key,
-        train_config_hash=train_config_hash,
+        model_bundle_hash=model_bundle_identity["bundle_hash"],
         job=job,
         provider_name=provider_name,
         output_path=output_path,
@@ -2407,7 +2583,7 @@ def run_projection_target(
         static_dataset_cache_key=static_dataset_cache_key,
         dynamic_dataset_cache_key=dynamic_dataset_cache_key,
         run_config_hash=run_config_hash,
-        train_config_hash=train_config_hash,
+        model_bundle_identity=model_bundle_identity,
         primary_tiles=primary_tiles,
         job=job,
     )
@@ -2424,9 +2600,8 @@ def run_projection_target(
     ):
         raise FileExistsError(f"Output already exists and overwrite=False: {output_path}")
 
-    counts = progress_counts(manifest)
-    if counts.get("done", 0) == len(manifest.get("tile_order", [])) and (download_only or output_path.exists()):
-        uncertainty_metric_paths: dict[str, str] = {
+    if manifest_output_complete(manifest) and (download_only or output_path.exists()):
+        existing_uncertainty_metric_paths: dict[str, str] = {
             metric_name: str(metric_path)
             for metric_name, metric_path in uncertainty_output_paths["metric_paths"].items()
             if Path(metric_path).exists()
@@ -2461,7 +2636,7 @@ def run_projection_target(
                 uncertainty_output_paths["uncertainty_summary_path"],
                 {
                     "uncertainty_enabled": True,
-                    "metric_output_paths": uncertainty_metric_paths,
+                    "metric_output_paths": existing_uncertainty_metric_paths,
                     "uncertainty_metrics": list(uncertainty_export_metrics),
                     "confidence_enabled": confidence_enabled,
                     "confidence_output_path": (
@@ -2492,11 +2667,12 @@ def run_projection_target(
             "pred_max": None,
             "pred_mean": None,
             "ensemble_members": len(model_members),
+            "model_bundle_hash": model_bundle_identity["bundle_hash"],
             "uncertainty_enabled": uncertainty_enabled,
             "confidence_enabled": confidence_enabled,
             "backfill_uncertainty_only": backfill_uncertainty_only,
             "uncertainty_metrics": list(uncertainty_export_metrics),
-            "uncertainty_output_paths": uncertainty_metric_paths,
+            "uncertainty_output_paths": existing_uncertainty_metric_paths,
             "confidence_output_path": (
                 None
                 if not confidence_enabled or not Path(uncertainty_output_paths["confidence_path"]).exists()
@@ -2529,6 +2705,7 @@ def run_projection_target(
                 "static_dataset_cache_key": static_dataset_cache_key,
                 "dynamic_dataset_cache_key": dynamic_dataset_cache_key,
                 "run_config_hash": run_config_hash,
+                "model_bundle_hash": model_bundle_identity["bundle_hash"],
                 "uncertainty": confidence_summary,
                 "runtime_summary": runtime_summary,
                 "grid_summary": grid_summary,
@@ -2563,7 +2740,7 @@ def run_projection_target(
     pred_sum = 0.0
     completed_since_save = 0
     failed_tiles: list[dict[str, Any]] = []
-    pending_futures: dict[str, Future] = {}
+    pending_futures: dict[str, TilePreparationFuture] = {}
     max_pending = max(1, int(job["prefetch_queue_size"]))
     try:
         with TerminalProgressDisplay(
@@ -2698,6 +2875,8 @@ def run_projection_target(
                         )
                         save_progress_manifest(manifest_path, manifest)
                         progress_display.update_from_manifest(manifest)
+                        if backend_adapter is None:
+                            raise RuntimeError("Inference tile processing requires a model backend adapter.")
                         prediction_blocks, stats = predict_probability_block(
                             feature_array,
                             aoi_mask,
@@ -2710,7 +2889,12 @@ def run_projection_target(
                             uncertainty_metrics=uncertainty_export_metrics,
                             uncertainty_epsilon=float(job.get("uncertainty_epsilon", 1e-6) or 1e-6),
                         )
-                        window = Window(int(tile["col_off"]), int(tile["row_off"]), int(tile["width"]), int(tile["height"]))
+                        window = window_factory(
+                            int(tile["col_off"]),
+                            int(tile["row_off"]),
+                            int(tile["width"]),
+                            int(tile["height"]),
+                        )
                         if dst is not None:
                             dst.write(prediction_blocks["mean"].astype(np.float32, copy=False), 1, window=window)
                         for metric_name, dataset in uncertainty_datasets.items():
@@ -2807,6 +2991,7 @@ def run_projection_target(
         "pred_max": None if download_only or valid_pixels == 0 else float(pred_max),
         "pred_mean": None if download_only or valid_pixels == 0 else float(pred_sum / valid_pixels),
         "ensemble_members": len(model_members),
+        "model_bundle_hash": model_bundle_identity["bundle_hash"],
         "uncertainty_enabled": uncertainty_enabled,
         "confidence_enabled": confidence_enabled,
         "backfill_uncertainty_only": backfill_uncertainty_only,
@@ -2847,6 +3032,7 @@ def run_projection_target(
             "static_dataset_cache_key": static_dataset_cache_key,
             "dynamic_dataset_cache_key": dynamic_dataset_cache_key,
             "run_config_hash": run_config_hash,
+            "model_bundle_hash": model_bundle_identity["bundle_hash"],
             "static_cache_dir": str(static_cache_dir),
             "dynamic_cache_dir": str(dynamic_cache_dir),
             "uncertainty": confidence_summary,
@@ -2891,17 +3077,48 @@ def run_projection_targets(
         }
         runtime_cfg["inference_batch_size"] = None
         model_members = []
+        model_bundle_identity = {
+            "schema_version": MODEL_BUNDLE_IDENTITY_VERSION,
+            "mode": "download_only",
+            "bundle_hash": "download_only",
+        }
     else:
         backend_adapter = ensure_inference_dependencies(job.get("model_backend"))
         device = backend_adapter["resolve_torch_device"](runtime_cfg)
         device_meta = backend_adapter["get_device_metadata"](runtime_cfg)
         runtime_cfg["inference_batch_size"] = resolve_inference_batch_size(job, device_meta)
+        members_meta, fold_manifest_path = resolve_model_member_artifacts(
+            cfg,
+            backend_adapter=backend_adapter,
+        )
+        model_bundle_identity = build_model_bundle_identity(
+            train_config_path=job["train_config_path"],
+            model_backend=job.get("model_backend"),
+            members_meta=members_meta,
+            fold_manifest_path=fold_manifest_path,
+        )
         model_members = load_model_scaler_members(
             cfg,
             feature_cols,
             device,
             backend_adapter=backend_adapter,
+            members_meta=members_meta,
         )
+        verify_model_bundle_unchanged(
+            model_bundle_identity,
+            train_config_path=job["train_config_path"],
+            model_backend=job.get("model_backend"),
+            members_meta=members_meta,
+            fold_manifest_path=fold_manifest_path,
+        )
+
+    if download_only:
+        inference_batch_size_summary = None
+    else:
+        resolved_inference_batch_size = runtime_cfg.get("inference_batch_size")
+        if resolved_inference_batch_size is None:
+            raise RuntimeError("Inference mode requires a resolved inference_batch_size.")
+        inference_batch_size_summary = int(resolved_inference_batch_size)
 
     raster_output_dir = resolve_raster_output_dir(job, PREDICTION_ROOT / "outputs" / "tif")
     json_output_dir = resolve_json_output_dir(job, PREDICTION_ROOT / "outputs" / "json")
@@ -2918,7 +3135,7 @@ def run_projection_targets(
         "width": int(width),
         "count": 1,
         "dtype": "float32",
-        "crs": CRS.from_wkt(ee_ctx.TARGET_PROJECTION_WKT),
+        "crs": crs_factory.from_wkt(ee_ctx.TARGET_PROJECTION_WKT),
         "transform": transform,
         "nodata": float(job.get("nodata_value", IN_MEMORY_NODATA_VALUE)),
         "compress": "lzw",
@@ -2978,11 +3195,12 @@ def run_projection_targets(
                 "ensemble_members": len(model_members),
                 "write_uncertainty_outputs": should_write_uncertainty_outputs(job, model_members),
                 "write_confidence_outputs": should_write_confidence_outputs(job, model_members),
-                "inference_batch_size": None if download_only else int(runtime_cfg["inference_batch_size"]),
+                "inference_batch_size": inference_batch_size_summary,
                 "download_workers": int(job["download_workers"]),
                 "prefetch_queue_size": int(job["prefetch_queue_size"]),
                 "show_progress": bool(job.get("show_progress", True)),
                 "model_backend": normalize_model_backend(job.get("model_backend")),
+                "model_bundle_hash": model_bundle_identity["bundle_hash"],
                 **device_meta,
             },
             ensure_ascii=False,
@@ -3024,6 +3242,7 @@ def run_projection_targets(
             device=device,
             device_meta=device_meta,
             model_members=model_members,
+            model_bundle_identity=model_bundle_identity,
             backend_adapter=backend_adapter,
             runtime_summary=runtime_summary,
             grid_summary=grid_summary,
