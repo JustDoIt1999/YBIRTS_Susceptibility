@@ -25,11 +25,7 @@ from .output_suffix import (
     apply_output_suffix_path_tagging,
     normalize_output_suffix,
 )
-from .selection import (
-    apply_selection_strategy_override,
-    normalize_selection_strategy,
-    run_lambda_selection,
-)
+from .selection import run_lambda_selection
 from .shared import build_fold_training_config, numeric_mean_std, save_json
 from .split import build_fold_manifest_from_config, save_manifest, save_manifest_cleaning_audit, summarize_manifest
 from .split import resolve_requested_fold_indices
@@ -136,7 +132,9 @@ def _add_rank_loss_mode_arg(parser: argparse.ArgumentParser) -> None:
         default=None,
         help=(
             "Optional rank loss mode override. Supported values: lambdarank, disabled "
-            "(aliases: lambda, ndcg_aware_lambdarank, none, off)."
+            "(aliases: lambda, ndcg_aware_lambdarank, none, off). "
+            "disabled means the classification baseline: only ranking loss is disabled; "
+            "model training and projection remain enabled."
         ),
     )
 
@@ -147,16 +145,6 @@ def _add_output_suffix_arg(parser: argparse.ArgumentParser) -> None:
         type=normalize_output_suffix,
         default=None,
         help="Optional output root suffix. Example: archive -> output_dbscan_archive.",
-    )
-
-
-def _add_selection_strategy_arg(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--selection-strategy",
-        type=normalize_selection_strategy,
-        metavar="{s1,s2}",
-        default=None,
-        help="Optional lambda selection strategy override. Supported values: s1 (AUC-first), s2 (Balanced-first).",
     )
 
 
@@ -535,11 +523,12 @@ def _run_command_handler(args: argparse.Namespace, cfg: dict[str, Any], base_dir
     if args.command == "validate":
         return _run_with_metadata(base_dir, "validate", cfg, lambda: run_validation(cfg))
     if args.command == "sweep-lambda":
-        return _run_with_metadata(base_dir, "sweep_lambda", cfg, lambda: run_lambda_sweep(cfg))
+        sweep_cfg = dict(cfg)
+        sweep_cfg["reuse_existing"] = bool(args.reuse_existing)
+        return _run_with_metadata(base_dir, "sweep_lambda", sweep_cfg, lambda: run_lambda_sweep(sweep_cfg))
     if args.command == "select-lambda":
         select_cfg = dict(cfg)
         select_cfg["train_after_select"] = bool(args.train) or bool(select_cfg.get("train_after_select", False))
-        select_cfg = apply_selection_strategy_override(select_cfg, getattr(args, "selection_strategy", None))
         select_cfg = apply_batch_size_path_tagging(select_cfg)
         runner = _run_select_and_train if select_cfg.get("train_after_select", False) else run_lambda_selection
         return _run_with_metadata(base_dir, "select_lambda", select_cfg, lambda: runner(select_cfg))
@@ -665,13 +654,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run lambda-grid sweep for rank-aware routes and collect ROC-AUC/F1 summaries.",
     )
     _apply_common_args(sweep_lambda, ["config", "batch_size", "rank_loss_mode", "output_suffix"])
+    sweep_reuse_group = sweep_lambda.add_mutually_exclusive_group()
+    sweep_reuse_group.add_argument(
+        "--reuse-existing",
+        dest="reuse_existing",
+        action="store_true",
+        help="Reuse only fingerprint-compatible, complete sweep runs.",
+    )
+    sweep_reuse_group.add_argument(
+        "--no-reuse-existing",
+        dest="reuse_existing",
+        action="store_false",
+        help="Force every requested sweep run to train again (default).",
+    )
+    sweep_lambda.set_defaults(reuse_existing=False)
 
     select_lambda = subparsers.add_parser(
         "select-lambda",
         help="Select the best lambda_rank from sweep summaries and optionally train final models.",
     )
     _apply_common_args(select_lambda, ["config", "batch_size", "rank_loss_mode", "output_suffix"])
-    _add_selection_strategy_arg(select_lambda)
     select_lambda.add_argument(
         "--train",
         action="store_true",
