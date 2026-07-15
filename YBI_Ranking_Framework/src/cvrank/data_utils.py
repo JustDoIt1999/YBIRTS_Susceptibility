@@ -16,7 +16,15 @@ try:
 except ImportError:  # pragma: no cover - optional for split/config-only commands
     torch = None
 
-from .constants import DEFAULT_GROUP_COL, DEFAULT_LABEL_COL, DEFAULT_RANK_COL, DEFAULT_YEAR_COL, FEATURE_COLS
+from .constants import (
+    DEFAULT_GROUP_COL,
+    DEFAULT_LABEL_COL,
+    DEFAULT_RANK_COL,
+    DEFAULT_YEAR_COL,
+    FEATURE_COLS,
+    RANK_LOSS_MODE_DISABLED,
+)
+from .rank_loss_mode import get_rank_loss_mode
 
 DEFAULT_INPUT_NODATA_VALUES = (-9999.0,)
 FEATURE_PREPARATION_ARTIFACT_VERSION = 1
@@ -145,7 +153,7 @@ def _resolve_rank_input(
     label_col: str,
 ) -> tuple[str | None, str, bool, list[str]]:
     requested_use_rank_aux = bool(config.get("use_rank_aux", _default_use_rank_aux(route)))
-    if not requested_use_rank_aux:
+    if not requested_use_rank_aux or get_rank_loss_mode(config) == RANK_LOSS_MODE_DISABLED:
         return None, "disabled", False, []
 
     rank_col = str(config.get("rank_col", DEFAULT_RANK_COL))
@@ -187,6 +195,11 @@ def _resolve_feature_cols(route: str, config: dict[str, Any], df: pd.DataFrame) 
 
 def _coerce_numeric_columns(df: pd.DataFrame, columns: list[str]) -> dict[str, pd.Series]:
     return {column: pd.to_numeric(df[column], errors="coerce") for column in columns}
+
+
+def _invalid_numeric_value_mask(raw: pd.Series, numeric: pd.Series) -> pd.Series:
+    """Mark present values that cannot be represented as finite model inputs."""
+    return raw.notna() & (numeric.isna() | ~np.isfinite(numeric))
 
 
 def _resolve_input_nodata_values(config: dict[str, Any]) -> tuple[float, ...]:
@@ -379,7 +392,7 @@ def apply_feature_preparation_artifact(
 
     for feature_name in raw_feature_cols:
         raw_numeric = pd.to_numeric(source[feature_name], errors="coerce")
-        invalid_numeric_mask |= source[feature_name].notna() & raw_numeric.isna()
+        invalid_numeric_mask |= _invalid_numeric_value_mask(source[feature_name], raw_numeric)
         normalized_feature, nodata_mask = _mask_input_nodata_values(raw_numeric, input_nodata_values)
 
         if feature_name in categorical_features:
@@ -466,6 +479,19 @@ def prepare_modeling_frame(
     else:
         include_rank = bool(include_rank_in_required) and rank_col is not None
     cluster_col = _resolve_cluster_col(route, config, source)
+    use_cluster_in_rank_loss = bool(
+        rank_aux_effective and config.get("use_cluster_in_rank_loss", False)
+    )
+    if use_cluster_in_rank_loss and cluster_col is None:
+        configured_cluster_col = str(
+            config.get("cluster_col", "Basin_cluster" if route == "basin" else "Cluster")
+        )
+        raise ValueError(
+            "use_cluster_in_rank_loss=true requires cluster column "
+            f"`{configured_cluster_col}`, but it was not found in the data."
+        )
+    if not use_cluster_in_rank_loss:
+        cluster_col = None
     raw_feature_cols = _resolve_feature_cols(route, config, source)
 
     required = [group_col, year_col, label_col, *raw_feature_cols]
@@ -506,16 +532,25 @@ def prepare_modeling_frame(
         fill_numeric_imputation=fill_numeric_imputation,
     )
 
-    missing_required_raw_na_mask = source[[group_col]].isna().any(axis=1) | feature_missing_required_raw_na_mask
+    required_value_columns = [group_col, year_col, label_col]
+    if include_rank and rank_col is not None:
+        required_value_columns.append(rank_col)
+    if cluster_col is not None:
+        required_value_columns.append(cluster_col)
+    required_value_columns = list(dict.fromkeys(required_value_columns))
+    missing_required_raw_na_mask = (
+        source[required_value_columns].isna().any(axis=1)
+        | feature_missing_required_raw_na_mask
+    )
     missing_required_input_nodata_mask = feature_missing_required_input_nodata_mask.copy()
 
     invalid_numeric_mask = feature_invalid_numeric_mask.copy()
     for column in [label_col, year_col]:
-        invalid_numeric_mask |= source[column].notna() & coerced_columns_raw[column].isna()
+        invalid_numeric_mask |= _invalid_numeric_value_mask(source[column], coerced_columns_raw[column])
     if include_rank and rank_col is not None:
-        invalid_numeric_mask |= source[rank_col].notna() & coerced_columns_raw[rank_col].isna()
+        invalid_numeric_mask |= _invalid_numeric_value_mask(source[rank_col], coerced_columns_raw[rank_col])
     if cluster_col is not None:
-        invalid_numeric_mask |= source[cluster_col].notna() & coerced_columns_raw[cluster_col].isna()
+        invalid_numeric_mask |= _invalid_numeric_value_mask(source[cluster_col], coerced_columns_raw[cluster_col])
 
     missing_required_mask = missing_required_raw_na_mask | missing_required_input_nodata_mask
     invalid_numeric_only_mask = (~missing_required_mask) & invalid_numeric_mask
@@ -546,13 +581,33 @@ def prepare_modeling_frame(
     if dropped_rows_invalid_numeric > 0:
         warning_messages.append(
             "Dropped "
-            f"{dropped_rows_invalid_numeric} rows because numeric conversion failed for required inputs."
+            f"{dropped_rows_invalid_numeric} rows because required numeric inputs could not be converted to finite values."
         )
 
     for message in warning_messages:
         warnings.warn(message, UserWarning, stacklevel=2)
 
     clean = source.loc[kept_mask].copy()
+    required_numeric_columns = [label_col, year_col]
+    if include_rank and rank_col is not None:
+        required_numeric_columns.append(rank_col)
+    if cluster_col is not None:
+        required_numeric_columns.append(cluster_col)
+    remaining_invalid = {
+        column: int(
+            (
+                coerced_columns_raw[column].loc[kept_mask].isna()
+                | ~np.isfinite(coerced_columns_raw[column].loc[kept_mask])
+            ).sum()
+        )
+        for column in dict.fromkeys(required_numeric_columns)
+    }
+    remaining_invalid = {column: count for column, count in remaining_invalid.items() if count > 0}
+    if remaining_invalid:
+        raise RuntimeError(
+            "Internal data-cleaning invariant violated: required numeric columns still contain "
+            f"missing or non-finite values: {remaining_invalid}"
+        )
     clean[group_col] = normalize_sample_id(clean[group_col])
     clean[label_col] = coerced_columns_raw[label_col].loc[kept_mask]
     if include_rank and rank_col is not None:
