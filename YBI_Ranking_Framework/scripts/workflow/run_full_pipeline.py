@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import os
 import shutil
 import subprocess
@@ -135,22 +136,24 @@ def selection_output_root(batch_size: str, rank_loss_mode: str, output_suffix: s
     return root / (rank_loss_mode or DEFAULT_RANK_LOSS_MODE)
 
 
-def selected_output_root_for_route(route: str, batch_size: str, rank_loss_mode: str, output_suffix: str) -> Path:
-    root = CVRANK_ROOT / "data" / "output" / append_output_suffix_name(f"output_{route}_selected", output_suffix)
-    if batch_size:
-        root = root / f"bs_{batch_size}"
-    return root / (rank_loss_mode or DEFAULT_RANK_LOSS_MODE)
+def sweep_reuse_flag(skip_existing: bool) -> str:
+    return "--reuse-existing" if skip_existing else "--no-reuse-existing"
 
 
 def print_effective_options(workflow_config: Path, skip_existing: bool, batch_size: str, rank_loss_mode: str, output_suffix: str) -> None:
     effective_batch_size = batch_size or "<route-config-default>"
     effective_rank_loss_mode = rank_loss_mode or "<route-config-default>"
+    rank_loss_mode_display = (
+        f"{effective_rank_loss_mode} [classification baseline; ranking loss disabled]"
+        if rank_loss_mode == "disabled"
+        else effective_rank_loss_mode
+    )
     effective_output_suffix = output_suffix or "<none>"
     print(f"Workflow config: {workflow_config}")
     print("Effective workflow options:")
     print(f"  skip_existing={str(skip_existing).lower()}")
     print(f"  batch_size={effective_batch_size}")
-    print(f"  rank_loss_mode={effective_rank_loss_mode}")
+    print(f"  rank_loss_mode={rank_loss_mode_display}")
     print(f"  output_suffix={effective_output_suffix}")
 
 
@@ -173,6 +176,46 @@ def all_paths_exist(paths: list[str]) -> bool:
 
 def all_globs_match(patterns: list[str]) -> bool:
     return all(glob.glob(pattern) for pattern in patterns)
+
+
+def selected_training_artifacts_complete(selection_manifest_path: Path, expected_routes: tuple[str, ...]) -> bool:
+    if not selection_manifest_path.exists():
+        return False
+    try:
+        manifest = json.loads(selection_manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    selected_routes = manifest.get("selected_routes")
+    if not isinstance(selected_routes, list):
+        return False
+    route_records = {
+        str(record.get("route", "")).strip().lower(): record
+        for record in selected_routes
+        if isinstance(record, dict)
+    }
+    for route in expected_routes:
+        record = route_records.get(route)
+        if record is None:
+            return False
+        config_path = Path(str(record.get("selected_config_path") or ""))
+        if not config_path.exists():
+            return False
+        try:
+            train_config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError):
+            return False
+        if not isinstance(train_config, dict):
+            return False
+        required_keys = (
+            "metrics_path",
+            "validation_metrics_path",
+            "history_path",
+            "fold_runs_manifest_path",
+        )
+        required_paths = [Path(str(train_config.get(key) or "")) for key in required_keys]
+        if not all(path.exists() and path.is_file() for path in required_paths):
+            return False
+    return True
 
 
 def run_step_if_needed(
@@ -336,22 +379,10 @@ def main(argv: list[str] | None = None) -> int:
             "sweep-lambda",
             "--config",
             str(sweep_config_to_run),
+            sweep_reuse_flag(bool(args.skip_existing)),
             *sweep_extra_args,
         ]
-        sweep_output_root = CVRANK_ROOT / "data" / "output" / "sweeps" / append_output_suffix_name("lambda_rank", output_suffix)
-        if batch_size:
-            sweep_output_root = sweep_output_root / f"bs_{batch_size}"
-        sweep_output_root = sweep_output_root / (rank_loss_mode or DEFAULT_RANK_LOSS_MODE)
-        run_step_if_needed(
-            "sweep-lambda",
-            skip_existing=bool(args.skip_existing),
-            success_globs=[
-                str(sweep_output_root / "lambda_sweep_runs*.csv"),
-                str(sweep_output_root / "lambda_sweep_summary*.csv"),
-                str(sweep_output_root / "lambda_sweep_manifest*.json"),
-            ],
-            command=sweep_command,
-        )
+        run_step("sweep-lambda", sweep_command)
 
         selection_root = selection_output_root(batch_size, rank_loss_mode, output_suffix)
         select_command = [
@@ -365,20 +396,13 @@ def main(argv: list[str] | None = None) -> int:
             *select_extra_args,
         ]
 
-        success_paths = [str(selection_root / "selection_manifest.json")]
-        success_globs = []
-        for route in routes_to_run:
-            route_selected_root = selected_output_root_for_route(route, batch_size, rank_loss_mode, output_suffix)
-            success_paths.append(str(route_selected_root / "selection" / f"{route}_best_train.yaml"))
-            success_globs.append(str(route_selected_root / "fold_runs_manifest*.json"))
-
-        run_step_if_needed(
-            "select-lambda (train)",
-            skip_existing=bool(args.skip_existing),
-            success_paths=success_paths,
-            success_globs=success_globs,
-            command=select_command,
-        )
+        selection_manifest_path = selection_root / "selection_manifest.json"
+        if bool(args.skip_existing) and selected_training_artifacts_complete(selection_manifest_path, routes_to_run):
+            print()
+            print("==> skip (select-lambda (train))")
+            print(f"    complete manifest: {selection_manifest_path}")
+        else:
+            run_step("select-lambda (train)", select_command)
     finally:
         if temp_sweep_yaml is not None and temp_sweep_yaml.exists():
             temp_sweep_yaml.unlink()
