@@ -1,7 +1,8 @@
-# Workflow-level defaults for `bash scripts/workflow/run_full_pipeline.sh`
+# Workflow-level defaults for both Python and shell workflow entry points.
 # Keep nullable values as null when you want the underlying route/lambda configs
 # to use their built-in defaults and keep the legacy untagged output layout.
 
 skip_existing: false
 batch_size: null
+# Set to disabled for the classification baseline (ranking loss off, training still enabled).
 rank_loss_mode: null
