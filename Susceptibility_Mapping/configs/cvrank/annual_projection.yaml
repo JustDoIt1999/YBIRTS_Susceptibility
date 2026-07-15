@@ -3,7 +3,10 @@
 model_backend: cvrank
 route: dbscan
 batch_size: 256
+# Use disabled for the classification baseline. It disables ranking loss only;
+# model training and annual projection still run normally.
 rank_loss_mode: ndcg_aware_lambdarank
+train_output_suffix: null
 
 # targets
 years:
