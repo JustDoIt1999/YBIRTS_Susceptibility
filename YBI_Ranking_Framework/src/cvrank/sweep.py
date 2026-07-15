@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -10,7 +11,7 @@ import yaml
 
 from .batch_size import get_batch_size_tag, merge_batch_size_metadata, tag_name
 from .config import load_yaml_config, resolve_config_paths, resolve_path
-from .constants import DEFAULT_LAMBDA_SWEEP_GRID
+from .constants import DEFAULT_LAMBDA_SWEEP_GRID, RANK_LOSS_MODE_DISABLED
 from .rank_loss_mode import (
     apply_rank_loss_mode_override,
     apply_rank_loss_mode_path_tagging,
@@ -19,6 +20,17 @@ from .rank_loss_mode import (
     merge_rank_loss_mode_metadata,
 )
 from .split import resolve_requested_fold_indices
+from .run_fingerprint import (
+    FileHashCache,
+    RUN_COMPLETION_FILENAME,
+    RUN_COMPLETION_SCHEMA_VERSION,
+    RUN_FINGERPRINT_SCHEMA_VERSION,
+    build_run_fingerprint,
+    build_training_code_identity,
+    compare_run_fingerprints,
+    describe_file,
+)
+from .shared import default_feature_preparation_path
 from .training import run_training
 
 
@@ -100,7 +112,15 @@ def _flatten_run_result(route: str, lambda_rank: float, fold_index: int, result:
 
 def _empty_runs_frame() -> pd.DataFrame:
     columns = list(_flatten_run_result("", 0.0, 0, {}, Path(".")))
-    columns.append("run_config_path")
+    columns.extend(
+        [
+            "run_config_path",
+            "cache_status",
+            "cache_reason",
+            "run_fingerprint",
+            "run_completion_path",
+        ]
+    )
     return pd.DataFrame(columns=columns)
 
 
@@ -130,8 +150,122 @@ def _sweep_result_path(run_dir: Path) -> Path:
     return run_dir / "sweep_result.json"
 
 
-def _has_reusable_run_artifacts(run_dir: Path) -> bool:
-    return _run_config_path(run_dir).exists() and _sweep_result_path(run_dir).exists()
+def _run_completion_path(run_dir: Path) -> Path:
+    return run_dir / RUN_COMPLETION_FILENAME
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temp_path.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2, default=str)
+            fh.flush()
+            os.fsync(fh.fileno())
+        temp_path.replace(path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def _expected_run_artifact_paths(run_config: dict[str, Any], run_dir: Path) -> dict[str, Path]:
+    return {
+        "resolved_run_config": _run_config_path(run_dir),
+        "sweep_result": _sweep_result_path(run_dir),
+        "model": Path(str(run_config["model_path"])),
+        "scaler": Path(str(run_config["scaler_path"])),
+        "feature_preparation": default_feature_preparation_path(run_config),
+        "metrics": Path(str(run_config["metrics_path"])),
+        "validation_metrics": Path(str(run_config["validation_metrics_path"])),
+        "history": Path(str(run_config["history_path"])),
+    }
+
+
+def _validate_structured_artifact(name: str, path: Path) -> bool:
+    try:
+        if name == "resolved_run_config":
+            with path.open("r", encoding="utf-8") as fh:
+                return isinstance(yaml.safe_load(fh), dict)
+        if name in {"sweep_result", "feature_preparation", "metrics", "validation_metrics"}:
+            with path.open("r", encoding="utf-8") as fh:
+                return isinstance(json.load(fh), dict)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, yaml.YAMLError):
+        return False
+    return True
+
+
+def _describe_complete_artifacts(
+    run_config: dict[str, Any],
+    run_dir: Path,
+    hash_cache: FileHashCache,
+) -> tuple[dict[str, dict[str, Any]] | None, str | None]:
+    descriptions: dict[str, dict[str, Any]] = {}
+    for name, path in _expected_run_artifact_paths(run_config, run_dir).items():
+        description = describe_file(path, hash_cache)
+        if not description.get("exists") or int(description.get("size", 0)) <= 0:
+            return None, f"incomplete_artifacts:{name}"
+        if not _validate_structured_artifact(name, path):
+            return None, f"invalid_artifact:{name}"
+        descriptions[name] = description
+    return descriptions, None
+
+
+def _load_run_completion(run_dir: Path) -> tuple[dict[str, Any] | None, str | None]:
+    path = _run_completion_path(run_dir)
+    if not path.exists():
+        return None, "legacy_unverified" if _has_partial_run_artifacts(run_dir) else "new_run"
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None, "invalid_completion_manifest"
+    if not isinstance(payload, dict):
+        return None, "invalid_completion_manifest"
+    if payload.get("schema_version") != RUN_COMPLETION_SCHEMA_VERSION:
+        return None, "completion_schema_changed"
+    if payload.get("status") != "complete":
+        return None, "incomplete_status"
+    return payload, None
+
+
+def _assess_reusable_run(
+    run_dir: Path,
+    run_config: dict[str, Any],
+    current_fingerprint: dict[str, Any],
+    hash_cache: FileHashCache,
+) -> tuple[dict[str, Any] | None, str]:
+    completion, completion_error = _load_run_completion(run_dir)
+    if completion is None:
+        return None, str(completion_error)
+
+    compatible, reason = compare_run_fingerprints(completion.get("fingerprint"), current_fingerprint)
+    if not compatible:
+        return None, reason
+
+    current_artifacts, artifact_error = _describe_complete_artifacts(run_config, run_dir, hash_cache)
+    if current_artifacts is None:
+        return None, str(artifact_error)
+    saved_artifacts = completion.get("artifacts")
+    if not isinstance(saved_artifacts, dict):
+        return None, "invalid_completion_artifacts"
+    for name, description in current_artifacts.items():
+        saved = saved_artifacts.get(name)
+        if not isinstance(saved, dict):
+            return None, f"untracked_artifact:{name}"
+        if saved.get("path") != description.get("path"):
+            return None, f"artifact_path_changed:{name}"
+        if saved.get("sha256") != description.get("sha256"):
+            return None, f"artifact_content_changed:{name}"
+
+    result_path = _sweep_result_path(run_dir)
+    try:
+        with result_path.open("r", encoding="utf-8") as fh:
+            row = json.load(fh)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None, "invalid_sweep_result"
+    if not isinstance(row, dict):
+        return None, "invalid_sweep_result"
+    return row, "reused_compatible"
 
 
 def _has_partial_run_artifacts(run_dir: Path) -> bool:
@@ -161,121 +295,6 @@ def _normalize_existing_run_row(
     normalized["rank_loss_mode"] = str(normalized.get("rank_loss_mode") or rank_loss_mode)
     normalized["batch_size_tag"] = normalized.get("batch_size_tag") or batch_size_tag
     return normalized
-
-
-def _load_existing_run_row(
-    run_dir: Path,
-    *,
-    route: str,
-    lambda_rank: float,
-    fold_index: int,
-    rank_loss_mode: str,
-    batch_size_tag: str | None,
-) -> dict[str, Any] | None:
-    if not _has_reusable_run_artifacts(run_dir):
-        return None
-
-    run_config_path = _run_config_path(run_dir)
-    result_path = _sweep_result_path(run_dir)
-    try:
-        with result_path.open("r", encoding="utf-8") as fh:
-            row = json.load(fh)
-    except (json.JSONDecodeError, OSError, TypeError, ValueError):
-        return None
-    if not isinstance(row, dict):
-        return None
-
-    return _normalize_existing_run_row(
-        row,
-        route=route,
-        lambda_rank=lambda_rank,
-        fold_index=fold_index,
-        run_dir=run_dir,
-        run_config_path=run_config_path,
-        rank_loss_mode=rank_loss_mode,
-        batch_size_tag=batch_size_tag,
-    )
-
-
-def _normalize_optional_text(value: Any) -> str | None:
-    if value is None or pd.isna(value):
-        return None
-    text = str(value).strip()
-    return text or None
-
-
-def _run_identity_key(
-    *,
-    route: str,
-    lambda_rank: float,
-    rank_loss_mode: str,
-    fold_index: int,
-    batch_size_tag: str | None,
-) -> tuple[str, float, str, int, str | None]:
-    return (
-        str(route).strip().lower(),
-        float(lambda_rank),
-        str(rank_loss_mode or ""),
-        int(fold_index),
-        _normalize_optional_text(batch_size_tag),
-    )
-
-
-def _load_existing_runs_lookup(runs_csv: Path) -> dict[tuple[str, float, str, int, str | None], dict[str, Any]]:
-    if not runs_csv.exists():
-        return {}
-
-    try:
-        runs_df = pd.read_csv(runs_csv)
-    except (OSError, ValueError, pd.errors.ParserError):
-        return {}
-
-    if runs_df.empty:
-        return {}
-
-    required_columns = {"route", "lambda_rank", "fold_index"}
-    if not required_columns.issubset(runs_df.columns):
-        return {}
-
-    lookup: dict[tuple[str, float, str, int, str | None], dict[str, Any]] = {}
-    for row in runs_df.to_dict(orient="records"):
-        try:
-            route = str(row.get("route", "")).strip().lower()
-            lambda_rank = float(row.get("lambda_rank"))
-            fold_index = int(row.get("fold_index"))
-        except (TypeError, ValueError):
-            continue
-
-        rank_loss_mode = str(row.get("rank_loss_mode") or "")
-        batch_size_tag = _normalize_optional_text(row.get("batch_size_tag"))
-        run_dir_raw = row.get("run_dir")
-        run_dir = Path(str(run_dir_raw)) if _normalize_optional_text(run_dir_raw) is not None else Path(".")
-        run_config_raw = row.get("run_config_path")
-        run_config_path = (
-            Path(str(run_config_raw))
-            if _normalize_optional_text(run_config_raw) is not None
-            else _run_config_path(run_dir)
-        )
-
-        key = _run_identity_key(
-            route=route,
-            lambda_rank=lambda_rank,
-            rank_loss_mode=rank_loss_mode,
-            fold_index=fold_index,
-            batch_size_tag=batch_size_tag,
-        )
-        lookup[key] = _normalize_existing_run_row(
-            row,
-            route=route,
-            lambda_rank=lambda_rank,
-            fold_index=fold_index,
-            run_dir=run_dir,
-            run_config_path=run_config_path,
-            rank_loss_mode=rank_loss_mode,
-            batch_size_tag=batch_size_tag,
-        )
-
-    return lookup
 
 
 def _dedupe_run_rows(run_rows: list[dict[str, Any]]) -> pd.DataFrame:
@@ -342,6 +361,7 @@ def _build_run_config(
 
 def run_lambda_sweep(config: dict[str, Any]) -> dict[str, Any]:
     base_dir = Path(config.get("base_dir", ".")).resolve()
+    reuse_existing = bool(config.get("reuse_existing", False))
     route_config_paths = config.get("route_config_paths")
     if not isinstance(route_config_paths, list) or not route_config_paths:
         raise ValueError("`route_config_paths` must be a non-empty list of route config paths.")
@@ -361,8 +381,6 @@ def run_lambda_sweep(config: dict[str, Any]) -> dict[str, Any]:
     summary_csv = resolve_path(path_tagging_config.get("summary_csv") or (sweep_root / "lambda_sweep_summary.csv"), base_dir=base_dir)
     if runs_csv is None or summary_csv is None:
         raise ValueError("Failed to resolve sweep output paths.")
-    existing_runs_lookup = _load_existing_runs_lookup(runs_csv)
-
     raw_lambda_grid, lambda_grid, dropped_duplicate_lambda_values = _dedupe_lambda_grid(
         list(config.get("lambda_grid", DEFAULT_LAMBDA_SWEEP_GRID))
     )
@@ -370,11 +388,16 @@ def run_lambda_sweep(config: dict[str, Any]) -> dict[str, Any]:
     run_rows: list[dict[str, Any]] = []
     route_fold_indices: dict[str, list[int]] = {}
     route_fold_resolution_source: dict[str, str] = {}
+    route_effective_lambda_grids: dict[str, list[float]] = {}
     n_requested_runs = 0
     n_unique_requested_runs = 0
     n_reused_runs = 0
     n_executed_runs = 0
     n_recovered_or_rerun_runs = 0
+    run_cache_events: list[dict[str, Any]] = []
+    cache_event_counts: dict[str, int] = {}
+    hash_cache = FileHashCache()
+    code_identity = build_training_code_identity(hash_cache)
     for route_cfg_path in route_config_paths:
         route_cfg_path = resolve_path(route_cfg_path, base_dir=base_dir)
         if route_cfg_path is None:
@@ -388,39 +411,79 @@ def run_lambda_sweep(config: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"Route `{route}` is not allowed in lambda sweep. Allowed: {sorted(ALLOWED_SWEEP_ROUTES)}")
 
         fold_indices, fold_resolution_source = _resolve_sweep_fold_plan(config, route_cfg)
+        route_rank_loss_mode = get_rank_loss_mode(route_cfg)
+        effective_lambda_grid = (
+            [0.0] if route_rank_loss_mode == RANK_LOSS_MODE_DISABLED else list(lambda_grid)
+        )
+        effective_raw_lambda_grid = (
+            [0.0] if route_rank_loss_mode == RANK_LOSS_MODE_DISABLED else list(raw_lambda_grid)
+        )
         route_fold_indices[route] = list(fold_indices)
         route_fold_resolution_source[route] = fold_resolution_source
-        n_requested_runs += len(fold_indices) * len(raw_lambda_grid)
-        n_unique_requested_runs += len(fold_indices) * len(lambda_grid)
+        route_effective_lambda_grids[route] = list(effective_lambda_grid)
+        n_requested_runs += len(fold_indices) * len(effective_raw_lambda_grid)
+        n_unique_requested_runs += len(fold_indices) * len(effective_lambda_grid)
         for fold_index in fold_indices:
-            for lambda_rank in lambda_grid:
+            for lambda_rank in effective_lambda_grid:
                 run_config, run_dir = _build_run_config(route_cfg, sweep_root, route, lambda_rank, fold_index)
-                existing_key = _run_identity_key(
-                    route=route,
-                    lambda_rank=lambda_rank,
-                    rank_loss_mode=str(run_config.get("rank_loss_mode") or ""),
-                    fold_index=fold_index,
-                    batch_size_tag=run_config.get("batch_size_tag"),
+                current_fingerprint = build_run_fingerprint(
+                    run_config,
+                    hash_cache=hash_cache,
+                    code_identity=code_identity,
                 )
                 existing_row = None
-                if _has_reusable_run_artifacts(run_dir):
-                    existing_row = existing_runs_lookup.get(existing_key)
-                if existing_row is None:
-                    existing_row = _load_existing_run_row(
-                    run_dir,
-                    route=route,
-                    lambda_rank=lambda_rank,
-                    fold_index=fold_index,
-                    rank_loss_mode=str(run_config.get("rank_loss_mode") or ""),
-                    batch_size_tag=run_config.get("batch_size_tag"),
+                cache_reason = "force_rerun"
+                if reuse_existing:
+                    existing_row, cache_reason = _assess_reusable_run(
+                        run_dir,
+                        run_config,
+                        current_fingerprint,
+                        hash_cache,
                     )
                 if existing_row is not None:
+                    existing_row = _normalize_existing_run_row(
+                        existing_row,
+                        route=route,
+                        lambda_rank=lambda_rank,
+                        fold_index=fold_index,
+                        run_dir=run_dir,
+                        run_config_path=_run_config_path(run_dir),
+                        rank_loss_mode=str(run_config.get("rank_loss_mode") or ""),
+                        batch_size_tag=run_config.get("batch_size_tag"),
+                    )
+                    existing_row["cache_status"] = "reused"
+                    existing_row["cache_reason"] = cache_reason
+                    existing_row["run_fingerprint"] = current_fingerprint["run_fingerprint"]
+                    existing_row["run_completion_path"] = str(_run_completion_path(run_dir))
                     run_rows.append(existing_row)
                     n_reused_runs += 1
+                    cache_event_counts[cache_reason] = cache_event_counts.get(cache_reason, 0) + 1
+                    run_cache_events.append(
+                        {
+                            "route": route,
+                            "lambda_rank": float(lambda_rank),
+                            "fold_index": int(fold_index),
+                            "status": "reused",
+                            "reason": cache_reason,
+                            "run_fingerprint": current_fingerprint["run_fingerprint"],
+                            "run_dir": str(run_dir),
+                        }
+                    )
+                    print(
+                        "[Sweep cache] reuse "
+                        f"route={route} lambda={lambda_rank} fold={fold_index} reason={cache_reason}"
+                    )
                     continue
 
                 rerun_existing = _has_partial_run_artifacts(run_dir)
+                print(
+                    "[Sweep cache] execute "
+                    f"route={route} lambda={lambda_rank} fold={fold_index} reason={cache_reason}"
+                )
                 run_dir.mkdir(parents=True, exist_ok=True)
+                completion_path = _run_completion_path(run_dir)
+                if completion_path.exists():
+                    completion_path.unlink()
                 run_config_path = _run_config_path(run_dir)
                 with run_config_path.open("w", encoding="utf-8") as fh:
                     yaml.safe_dump(run_config, fh, sort_keys=False, allow_unicode=True)
@@ -428,13 +491,47 @@ def run_lambda_sweep(config: dict[str, Any]) -> dict[str, Any]:
                 result = run_training(run_config)
                 row = _flatten_run_result(route, lambda_rank, fold_index, result, run_dir)
                 row["run_config_path"] = str(run_config_path)
+                row["cache_status"] = "executed"
+                row["cache_reason"] = cache_reason
+                row["run_fingerprint"] = current_fingerprint["run_fingerprint"]
+                row["run_completion_path"] = str(completion_path)
                 run_rows.append(row)
                 n_executed_runs += 1
                 if rerun_existing:
                     n_recovered_or_rerun_runs += 1
 
-                with _sweep_result_path(run_dir).open("w", encoding="utf-8") as fh:
-                    json.dump(row, fh, ensure_ascii=False, indent=2, default=str)
+                _atomic_write_json(_sweep_result_path(run_dir), row)
+                completed_artifacts, artifact_error = _describe_complete_artifacts(
+                    run_config,
+                    run_dir,
+                    hash_cache,
+                )
+                if completed_artifacts is None:
+                    raise RuntimeError(
+                        f"Sweep training finished without a complete artifact set: {artifact_error}; "
+                        f"run_dir={run_dir}"
+                    )
+                _atomic_write_json(
+                    completion_path,
+                    {
+                        "schema_version": RUN_COMPLETION_SCHEMA_VERSION,
+                        "status": "complete",
+                        "fingerprint": current_fingerprint,
+                        "artifacts": completed_artifacts,
+                    },
+                )
+                cache_event_counts[cache_reason] = cache_event_counts.get(cache_reason, 0) + 1
+                run_cache_events.append(
+                    {
+                        "route": route,
+                        "lambda_rank": float(lambda_rank),
+                        "fold_index": int(fold_index),
+                        "status": "executed",
+                        "reason": cache_reason,
+                        "run_fingerprint": current_fingerprint["run_fingerprint"],
+                        "run_dir": str(run_dir),
+                    }
+                )
 
     runs_df = _dedupe_run_rows(run_rows)
 
@@ -497,6 +594,7 @@ def run_lambda_sweep(config: dict[str, Any]) -> dict[str, Any]:
         "lambda_grid": lambda_grid,
         "raw_lambda_grid": raw_lambda_grid,
         "deduped_lambda_grid": lambda_grid,
+        "effective_lambda_grids": route_effective_lambda_grids,
         "dropped_duplicate_lambda_values": dropped_duplicate_lambda_values,
         "fold_indices": sorted({fold_index for values in route_fold_indices.values() for fold_index in values}),
         "route_fold_indices": route_fold_indices,
@@ -519,6 +617,11 @@ def run_lambda_sweep(config: dict[str, Any]) -> dict[str, Any]:
         "n_reused_runs": int(n_reused_runs),
         "n_executed_runs": int(n_executed_runs),
         "n_recovered_or_rerun_runs": int(n_recovered_or_rerun_runs),
+        "reuse_existing": reuse_existing,
+        "run_fingerprint_schema_version": RUN_FINGERPRINT_SCHEMA_VERSION,
+        "training_code_sha256": code_identity["sha256"],
+        "cache_event_counts": cache_event_counts,
+        "run_cache_events": run_cache_events,
         "routes": sorted(set(runs_df["route"].astype(str))) if not runs_df.empty else [],
     }
     manifest_path = sweep_root / tag_name("lambda_sweep_manifest.json", batch_size_tag)
