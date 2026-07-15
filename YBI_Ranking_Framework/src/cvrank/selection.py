@@ -9,22 +9,31 @@ from typing import Any
 import pandas as pd
 import yaml
 
-from .batch_size import apply_batch_size_path_tagging, get_batch_size_tag, merge_batch_size_metadata
+from .artifact_layout import (
+    ARTIFACT_LAYOUT_VERSION,
+    build_selected_route_root,
+    make_selected_model_identity,
+)
+from .batch_size import (
+    BATCH_SIZE_SOURCE_CONFIG,
+    BATCH_SIZE_SOURCE_KEY,
+    BATCH_SIZE_TAG_KEY,
+    make_batch_size_tag,
+    merge_batch_size_metadata,
+)
 from .config import load_yaml_config, resolve_config_paths, resolve_path
-from .output_suffix import append_suffix_to_name, extract_component_suffix, get_output_suffix
+from .output_suffix import get_output_suffix
 from .rank_loss_mode import (
-    ALLOWED_RANK_LOSS_MODES,
+    SUPPORTED_RANK_LOSS_MODES,
     apply_rank_loss_mode_override,
-    apply_rank_loss_mode_path_tagging,
     get_explicit_rank_loss_mode,
-    get_rank_loss_mode_path_tag,
     get_rank_loss_mode,
     merge_rank_loss_mode_metadata,
     normalize_rank_loss_mode,
     tag_rank_loss_mode_directory,
     tag_rank_loss_mode_file_parent,
 )
-from .batch_size import tag_directory_path, tag_file_path
+from .constants import RANK_LOSS_MODE_DISABLED
 
 
 def _resolve_route_config(route_cfg_path: Path) -> dict[str, Any]:
@@ -51,18 +60,11 @@ SELECTION_BASE_REQUIRED_COLUMNS = [
     "accuracy_mean",
 ]
 OPTIONAL_RANK_SORT_COLUMN = "pairwise_rank_accuracy_mean"
-SELECTION_STRATEGY_KEY = "selection_strategy"
-SELECTION_STRATEGY_TAG_KEY = "selection_strategy_tag"
-SELECTION_STRATEGY_SOURCE_KEY = "selection_strategy_source"
-
 SELECTION_STRATEGY_S1 = "s1"
 SELECTION_STRATEGY_S2 = "s2"
-DEFAULT_SELECTION_STRATEGY = SELECTION_STRATEGY_S2
-ALLOWED_SELECTION_STRATEGIES = {SELECTION_STRATEGY_S1, SELECTION_STRATEGY_S2}
-
-SELECTION_STRATEGY_SOURCE_DEFAULT = "default"
-SELECTION_STRATEGY_SOURCE_CONFIG = "config"
-SELECTION_STRATEGY_SOURCE_CLI_OVERRIDE = "cli_override"
+SELECTION_POLICY = "s2_first_adaptive_s1_fallback"
+CLASSIFICATION_BASELINE_POLICY = "classification_baseline"
+SELECTION_POLICY_KEY = "selection_policy"
 SELECTION_FILTER_TYPE_NONE = "none"
 SELECTION_FILTER_TYPE_BALANCED_BASELINE_GATE = "balanced_baseline_gate"
 
@@ -73,15 +75,6 @@ _TRAINING_FILE_KEYS = {
     "validation_metrics_path",
     "history_path",
     "fold_runs_manifest_path",
-}
-
-_SELECTION_STRATEGY_ALIASES = {
-    SELECTION_STRATEGY_S1: SELECTION_STRATEGY_S1,
-    SELECTION_STRATEGY_S2: SELECTION_STRATEGY_S2,
-}
-_SELECTION_STRATEGY_TAGS = {
-    SELECTION_STRATEGY_S1: SELECTION_STRATEGY_S1,
-    SELECTION_STRATEGY_S2: SELECTION_STRATEGY_S2,
 }
 
 
@@ -115,94 +108,14 @@ def apply_lambda_rank_override(config: dict[str, Any], requested_lambda_rank: An
     return updated
 
 
-def normalize_selection_strategy(value: Any) -> str:
-    text = str(value or "").strip().lower()
-    normalized = _SELECTION_STRATEGY_ALIASES.get(text)
-    if normalized is None:
+def ensure_selection_policy_not_configurable(config: dict[str, Any]) -> None:
+    legacy_keys = ("selection_strategy", "selection_strategy_tag", "selection_strategy_source")
+    configured = [key for key in legacy_keys if config.get(key) not in (None, "")]
+    if configured:
         raise ValueError(
-            "Invalid selection strategy "
-            f"{value!r}. Expected one of: {sorted(ALLOWED_SELECTION_STRATEGIES)}."
+            "Lambda selection uses the fixed adaptive policy "
+            f"`{SELECTION_POLICY}`; remove unsupported configurable keys: {configured}."
         )
-    return normalized
-
-
-def selection_strategy_to_tag(value: Any) -> str:
-    return _SELECTION_STRATEGY_TAGS[normalize_selection_strategy(value)]
-
-
-def normalize_selection_strategy_tag(value: Any) -> str:
-    return selection_strategy_to_tag(value)
-
-
-def get_selection_strategy_tag_aliases(value: Any) -> tuple[str, ...]:
-    strategy = normalize_selection_strategy(value)
-    return (selection_strategy_to_tag(strategy),)
-
-
-def get_selection_strategy(config: dict[str, Any] | None) -> str:
-    if not isinstance(config, dict):
-        return DEFAULT_SELECTION_STRATEGY
-    value = config.get(SELECTION_STRATEGY_KEY)
-    if value in (None, ""):
-        return DEFAULT_SELECTION_STRATEGY
-    return normalize_selection_strategy(value)
-
-
-def get_selection_strategy_tag(config: dict[str, Any] | None) -> str | None:
-    if not isinstance(config, dict):
-        return None
-    value = config.get(SELECTION_STRATEGY_TAG_KEY)
-    if value in (None, ""):
-        return None
-    return normalize_selection_strategy_tag(value)
-
-
-def get_selection_strategy_path_tag(config: dict[str, Any] | None) -> str | None:
-    strategy = get_selection_strategy(config)
-    tag = get_selection_strategy_tag(config)
-    if tag is not None:
-        return tag
-    return selection_strategy_to_tag(strategy)
-
-
-def merge_selection_strategy_metadata(target: dict[str, Any], source: dict[str, Any] | None) -> dict[str, Any]:
-    merged = dict(target)
-    if not isinstance(source, dict):
-        return merged
-
-    if source.get(SELECTION_STRATEGY_KEY) not in (None, ""):
-        merged[SELECTION_STRATEGY_KEY] = normalize_selection_strategy(source[SELECTION_STRATEGY_KEY])
-    if source.get(SELECTION_STRATEGY_TAG_KEY) not in (None, ""):
-        merged[SELECTION_STRATEGY_TAG_KEY] = normalize_selection_strategy_tag(source[SELECTION_STRATEGY_TAG_KEY])
-    if source.get(SELECTION_STRATEGY_SOURCE_KEY) not in (None, ""):
-        merged[SELECTION_STRATEGY_SOURCE_KEY] = str(source[SELECTION_STRATEGY_SOURCE_KEY])
-    return merged
-
-
-def apply_selection_strategy_override(config: dict[str, Any], requested_strategy: Any | None) -> dict[str, Any]:
-    updated = dict(config)
-    if requested_strategy is not None:
-        updated[SELECTION_STRATEGY_KEY] = normalize_selection_strategy(requested_strategy)
-        updated[SELECTION_STRATEGY_SOURCE_KEY] = SELECTION_STRATEGY_SOURCE_CLI_OVERRIDE
-    elif updated.get(SELECTION_STRATEGY_KEY) in (None, ""):
-        updated[SELECTION_STRATEGY_KEY] = DEFAULT_SELECTION_STRATEGY
-        updated[SELECTION_STRATEGY_SOURCE_KEY] = SELECTION_STRATEGY_SOURCE_DEFAULT
-    else:
-        updated[SELECTION_STRATEGY_KEY] = normalize_selection_strategy(updated[SELECTION_STRATEGY_KEY])
-
-    strategy = updated[SELECTION_STRATEGY_KEY]
-    updated[SELECTION_STRATEGY_TAG_KEY] = selection_strategy_to_tag(strategy)
-    if updated.get(SELECTION_STRATEGY_SOURCE_KEY) in (None, ""):
-        updated[SELECTION_STRATEGY_SOURCE_KEY] = SELECTION_STRATEGY_SOURCE_CONFIG
-    return updated
-
-
-def tag_selection_output_root(path: str | Path, config: dict[str, Any]) -> Path:
-    return Path(path)
-
-
-def apply_selection_strategy_training_path_tagging(config: dict[str, Any]) -> dict[str, Any]:
-    return config
 
 
 def ensure_required_columns(frame: pd.DataFrame, required: list[str]) -> None:
@@ -286,7 +199,8 @@ def _build_selection_metadata(
     filter_type: str,
 ) -> dict[str, Any]:
     return {
-        "selection_strategy": strategy,
+        SELECTION_POLICY_KEY: SELECTION_POLICY,
+        "selection_stage": strategy,
         "selection_filter_type": filter_type,
         "baseline_lambda_rank": float(baseline["lambda_rank"]),
         "baseline_roc_auc_mean": float(baseline["roc_auc_mean"]),
@@ -349,24 +263,18 @@ def _select_s2_candidate(candidate: pd.DataFrame) -> tuple[pd.DataFrame, dict[st
 
 def pick_top_candidate_with_metadata(
     frame: pd.DataFrame,
-    selection_strategy: str = DEFAULT_SELECTION_STRATEGY,
 ) -> tuple[pd.Series, list[str], list[bool], dict[str, Any]]:
     cleaned = clean_candidate_frame(frame)
-    normalized_strategy = SELECTION_STRATEGY_S2
-    fallback_to_s1 = False
-
-    if normalized_strategy == SELECTION_STRATEGY_S1:
-        eligible, metadata = _select_s1_candidate(cleaned)
-    elif normalized_strategy == SELECTION_STRATEGY_S2:
-        eligible, metadata = _select_s2_candidate(cleaned)
-        if eligible.empty:
-            print("[Selection] S2 matched no nonzero lambda. Adaptive fallback to S1 strategy...")
-            eligible, metadata_s1 = _select_s1_candidate(cleaned)
-            metadata["selection_strategy_actual"] = "s1_hybrid_fallback"
-            metadata["s2_fallback_to_s1"] = True
-            fallback_to_s1 = True
-    else:
-        raise ValueError(f"Unsupported selection strategy: {selection_strategy!r}")
+    eligible, metadata = _select_s2_candidate(cleaned)
+    metadata["selection_stage_actual"] = SELECTION_STRATEGY_S2
+    metadata["selection_fallback_used"] = False
+    if eligible.empty:
+        print("[Selection] S2 matched no eligible nonzero lambda. Adaptive fallback to S1...")
+        eligible, fallback_metadata = _select_s1_candidate(cleaned)
+        metadata["selection_stage_actual"] = "s1_fallback"
+        metadata["selection_fallback_used"] = True
+        metadata["fallback_eligible_candidate_count"] = int(fallback_metadata["eligible_candidate_count"])
+        metadata["fallback_filtered_candidate_count"] = int(fallback_metadata["filtered_candidate_count"])
 
     if eligible.empty:
         baseline = resolve_zero_lambda_baseline(cleaned)
@@ -379,16 +287,43 @@ def pick_top_candidate_with_metadata(
     if selected.empty:
         raise ValueError(f"Unable to map selected lambda_rank={best_lambda_rank} back to original metrics.")
     metadata["selection_used_lambda_zero_fallback"] = bool(best_lambda_rank == 0)
-    if fallback_to_s1:
-        metadata["selection_used_lambda_zero_fallback"] = bool(best_lambda_rank == 0)
     return selected.iloc[0], sort_columns, sort_ascending, metadata
+
+
+def pick_classification_baseline_candidate_with_metadata(
+    frame: pd.DataFrame,
+) -> tuple[pd.Series, list[str], list[bool], dict[str, Any]]:
+    cleaned = clean_candidate_frame(frame)
+    baseline_rows = cleaned[cleaned["lambda_rank"] == 0].copy()
+    if baseline_rows.empty:
+        raise ValueError("Classification-baseline selection requires a lambda=0 candidate.")
+    ranked, sort_columns, sort_ascending = sort_candidate_frame(baseline_rows)
+    baseline = ranked.iloc[0]
+    nonzero = cleaned[cleaned["lambda_rank"] != 0].copy()
+    metadata = {
+        SELECTION_POLICY_KEY: CLASSIFICATION_BASELINE_POLICY,
+        "selection_stage": CLASSIFICATION_BASELINE_POLICY,
+        "selection_stage_actual": CLASSIFICATION_BASELINE_POLICY,
+        "selection_filter_type": SELECTION_FILTER_TYPE_NONE,
+        "selection_fallback_used": False,
+        "selection_used_lambda_zero_fallback": False,
+        "baseline_lambda_rank": 0.0,
+        "baseline_roc_auc_mean": float(baseline["roc_auc_mean"]),
+        "baseline_accuracy_mean": float(baseline["accuracy_mean"]),
+        "baseline_f1_mean": float(baseline["f1_mean"]),
+        "baseline_kappa_mean": float(baseline["kappa_mean"]),
+        "total_candidate_count": int(len(cleaned)),
+        "nonzero_candidate_count": int(len(nonzero)),
+        "eligible_candidate_count": int(len(baseline_rows)),
+        "filtered_candidate_count": int(len(nonzero)),
+    }
+    return baseline, sort_columns, sort_ascending, metadata
 
 
 def pick_top_candidate(
     frame: pd.DataFrame,
-    selection_strategy: str = DEFAULT_SELECTION_STRATEGY,
 ) -> tuple[pd.Series, list[str], list[bool]]:
-    best_row, sort_columns, sort_ascending, _metadata = pick_top_candidate_with_metadata(frame, selection_strategy)
+    best_row, sort_columns, sort_ascending, _metadata = pick_top_candidate_with_metadata(frame)
     return best_row, sort_columns, sort_ascending
 
 
@@ -399,36 +334,15 @@ def lambda_label(value: Any) -> str:
     return text.replace(".", "p")
 
 
-def selection_root_without_grouping(output_root: Path, config: dict[str, Any]) -> Path:
-    root = Path(output_root)
-    strategy_tag = get_selection_strategy_tag(config)
-    batch_size_tag = get_batch_size_tag(config)
-    rank_loss_mode_tag = get_rank_loss_mode_path_tag(config)
-
-    if strategy_tag and root.name in get_selection_strategy_tag_aliases(strategy_tag):
-        root = root.parent
-    if rank_loss_mode_tag and root.name == rank_loss_mode_tag:
-        root = root.parent
-    if batch_size_tag and root.name == batch_size_tag:
-        root = root.parent
-    return root
-
-
-def selection_workspace_root(output_root: Path, config: dict[str, Any]) -> Path:
-    return selection_root_without_grouping(output_root, config).parent
-
-
-def _resolve_selection_output_suffix(selection_output_root: Path, config: dict[str, Any]) -> str | None:
-    explicit = get_output_suffix(config)
-    if explicit is not None:
-        return explicit
-    return extract_component_suffix(selection_root_without_grouping(selection_output_root, config).name, "selected_lambda")
-
-
-def selected_output_root_for_route(selection_output_root: Path, route: str, config: dict[str, Any]) -> Path:
-    workspace_root = selection_workspace_root(selection_output_root, config)
-    base_name = f"output_{route}_selected"
-    return workspace_root / append_suffix_to_name(base_name, _resolve_selection_output_suffix(selection_output_root, config))
+def selection_workspace_root(selection_output_root: Path) -> Path:
+    root = Path(selection_output_root).resolve()
+    for candidate in (root, *root.parents):
+        if candidate.name == "selected_lambda" or candidate.name.startswith("selected_lambda_"):
+            return candidate.parent
+    raise ValueError(
+        "Unable to locate the CVRank output workspace from selection output root: "
+        f"{selection_output_root}"
+    )
 
 
 def selection_dir_for_output_root(output_root: Path) -> Path:
@@ -439,13 +353,11 @@ def build_final_training_config(
     base_config: dict[str, Any],
     selected_row,
     selection_output_root: Path,
+    *,
+    selection_policy: str = SELECTION_POLICY,
 ) -> tuple[dict[str, Any], Path, Path, Path, bool]:
     route = str(base_config.get("route", "")).strip().lower()
     lambda_rank = float(selected_row["lambda_rank"])
-    final_run_root = selected_output_root_for_route(selection_output_root, route, base_config)
-    model_dir = final_run_root / "model"
-    prefix = f"{route}_lambda_{lambda_label(lambda_rank)}"
-
     final_config = deepcopy(base_config)
     final_config.pop("fold_index", None)
     final_config.pop("fold_indices", None)
@@ -454,8 +366,33 @@ def build_final_training_config(
         base_config.get("rank_loss_mode", "ndcg_aware_lambdarank"),
     )
     final_config["rank_loss_mode"] = normalize_rank_loss_mode(selected_rank_loss_mode)
+    if final_config["rank_loss_mode"] == RANK_LOSS_MODE_DISABLED and lambda_rank != 0:
+        raise ValueError(
+            "Classification-baseline training requires lambda_rank=0 when rank_loss_mode=disabled."
+        )
     final_config = apply_rank_loss_mode_override(final_config, None)
     final_config = apply_lambda_rank_override(final_config, lambda_rank)
+    identity = make_selected_model_identity(
+        route=route,
+        batch_size=final_config.get("batch_size"),
+        rank_loss_mode=final_config["rank_loss_mode"],
+        train_output_suffix=get_output_suffix(final_config),
+    )
+    final_config["batch_size"] = identity.batch_size
+    final_config[BATCH_SIZE_TAG_KEY] = make_batch_size_tag(identity.batch_size)
+    if final_config.get(BATCH_SIZE_SOURCE_KEY) in (None, ""):
+        final_config[BATCH_SIZE_SOURCE_KEY] = BATCH_SIZE_SOURCE_CONFIG
+    final_config["artifact_layout_version"] = ARTIFACT_LAYOUT_VERSION
+    final_config["artifact_identity"] = {
+        **identity.as_dict(),
+        SELECTION_POLICY_KEY: selection_policy,
+    }
+    final_run_root = build_selected_route_root(
+        selection_workspace_root(selection_output_root),
+        identity,
+    )
+    model_dir = final_run_root / "model"
+    prefix = f"{route}_lambda_{lambda_label(lambda_rank)}"
     final_config["output_root"] = str(final_run_root)
     final_config["model_path"] = str(model_dir / f"{prefix}_model.pth")
     final_config["scaler_path"] = str(model_dir / f"{prefix}_scaler.pkl")
@@ -463,11 +400,10 @@ def build_final_training_config(
     final_config["validation_metrics_path"] = str(model_dir / f"{prefix}_validation_metrics.json")
     final_config["history_path"] = str(model_dir / f"{prefix}_train_history.csv")
     final_config["fold_runs_manifest_path"] = str(final_run_root / "fold_runs_manifest.json")
-    final_config["selection_source"] = "lambda_sweep_summary"
-    final_config = apply_batch_size_path_tagging(final_config)
-    final_config = apply_rank_loss_mode_path_tagging(final_config)
-    final_config = apply_selection_strategy_training_path_tagging(final_config)
-    final_run_root = Path(str(final_config["output_root"]))
+    final_config["selection_source"] = (
+        "classification_baseline" if selection_policy == CLASSIFICATION_BASELINE_POLICY else "lambda_sweep_summary"
+    )
+    final_config[SELECTION_POLICY_KEY] = selection_policy
     selection_dir = selection_dir_for_output_root(final_run_root)
 
     final_config_path = selection_dir / f"{route}_best_train.yaml"
@@ -538,7 +474,7 @@ def _require_summary_columns(summary_df: pd.DataFrame) -> None:
         except ValueError:
             invalid.append(mode)
             continue
-        if normalized not in ALLOWED_RANK_LOSS_MODES:
+        if normalized not in SUPPORTED_RANK_LOSS_MODES:
             invalid.append(mode)
     if invalid:
         raise ValueError(
@@ -549,19 +485,19 @@ def _require_summary_columns(summary_df: pd.DataFrame) -> None:
 
 def _pick_best_candidate(
     route_df: pd.DataFrame,
-    selection_strategy: str,
 ) -> tuple[pd.Series, list[str], list[bool]]:
-    return pick_top_candidate(route_df, selection_strategy)
+    return pick_top_candidate(route_df)
 
 
 def run_lambda_selection(config: dict[str, Any]) -> dict[str, Any]:
-    config = apply_selection_strategy_override(config, None)
+    ensure_selection_policy_not_configurable(config)
+    config = dict(config)
+    config[SELECTION_POLICY_KEY] = SELECTION_POLICY
     base_dir = Path(config.get("base_dir", ".")).resolve()
     path_tagging_config = dict(config)
     grouping_rank_loss_mode = _resolve_selection_grouping_rank_loss_mode(config, base_dir)
     if grouping_rank_loss_mode is not None:
         path_tagging_config["rank_loss_mode"] = grouping_rank_loss_mode
-    selection_strategy = get_selection_strategy(config)
     summary_csv = resolve_path(config.get("summary_csv"), base_dir=base_dir)
     if summary_csv is None:
         raise ValueError("`summary_csv` is required for lambda selection.")
@@ -575,7 +511,6 @@ def run_lambda_selection(config: dict[str, Any]) -> dict[str, Any]:
     if output_root is None:
         output_root = (base_dir / "data" / "output" / "selected_lambda").resolve()
     output_root = tag_rank_loss_mode_directory(output_root, path_tagging_config)
-    output_root = tag_selection_output_root(output_root, config)
     output_root.mkdir(parents=True, exist_ok=True)
 
     route_config_paths = config.get("route_config_paths")
@@ -600,7 +535,9 @@ def run_lambda_selection(config: dict[str, Any]) -> dict[str, Any]:
         route_cfg = merge_batch_size_metadata(route_cfg, config)
         route_cfg = merge_rank_loss_mode_metadata(route_cfg, config)
         route_cfg = apply_rank_loss_mode_override(route_cfg, None)
-        route_cfg = merge_selection_strategy_metadata(route_cfg, config)
+        if get_output_suffix(config) is not None:
+            route_cfg["output_suffix"] = get_output_suffix(config)
+        ensure_selection_policy_not_configurable(route_cfg)
         route = str(route_cfg.get("route", "")).strip().lower()
         if route not in ALLOWED_SELECTION_ROUTES:
             raise ValueError(f"Route `{route}` is not allowed for lambda selection.")
@@ -618,14 +555,23 @@ def run_lambda_selection(config: dict[str, Any]) -> dict[str, Any]:
                 f"`{target_rank_loss_mode}` in {summary_csv}"
             )
 
-        best_row, sort_columns, sort_ascending, decision_metadata = pick_top_candidate_with_metadata(
-            route_df,
-            selection_strategy=selection_strategy,
+        effective_selection_policy = (
+            CLASSIFICATION_BASELINE_POLICY
+            if target_rank_loss_mode == RANK_LOSS_MODE_DISABLED
+            else SELECTION_POLICY
         )
+        route_cfg[SELECTION_POLICY_KEY] = effective_selection_policy
+        if target_rank_loss_mode == RANK_LOSS_MODE_DISABLED:
+            best_row, sort_columns, sort_ascending, decision_metadata = (
+                pick_classification_baseline_candidate_with_metadata(route_df)
+            )
+        else:
+            best_row, sort_columns, sort_ascending, decision_metadata = pick_top_candidate_with_metadata(route_df)
         final_config, final_config_path, final_run_root, selection_decision_path, selected_config_unchanged = build_final_training_config(
             route_cfg,
             best_row,
             output_root,
+            selection_policy=effective_selection_policy,
         )
 
         selected_row = {
@@ -649,9 +595,9 @@ def run_lambda_selection(config: dict[str, Any]) -> dict[str, Any]:
             "batch_size": int(final_config.get("batch_size")) if final_config.get("batch_size") is not None else None,
             "batch_size_tag": final_config.get("batch_size_tag"),
             "batch_size_source": final_config.get("batch_size_source"),
-            "selection_strategy": final_config.get("selection_strategy", selection_strategy),
-            "selection_strategy_tag": final_config.get("selection_strategy_tag"),
-            "selection_strategy_source": final_config.get("selection_strategy_source"),
+            SELECTION_POLICY_KEY: effective_selection_policy,
+            "artifact_layout_version": final_config.get("artifact_layout_version"),
+            "artifact_identity": final_config.get("artifact_identity"),
             "source_summary_csv": str(summary_csv),
             "route_config_path": str(route_cfg_path),
             "selected_config_path": str(final_config_path),
@@ -671,10 +617,11 @@ def run_lambda_selection(config: dict[str, Any]) -> dict[str, Any]:
             "baseline_f1_mean": round_metric_value(decision_metadata["baseline_f1_mean"]),
             "baseline_kappa_mean": round_metric_value(decision_metadata["baseline_kappa_mean"]),
         }
-        if "selection_strategy_actual" in decision_metadata:
-            selected_row["selection_strategy_actual"] = str(decision_metadata["selection_strategy_actual"])
-        if "s2_fallback_to_s1" in decision_metadata:
-            selected_row["s2_fallback_to_s1"] = bool(decision_metadata["s2_fallback_to_s1"])
+        selected_row["selection_stage_actual"] = str(decision_metadata["selection_stage_actual"])
+        selected_row["selection_fallback_used"] = bool(decision_metadata["selection_fallback_used"])
+        if "fallback_eligible_candidate_count" in decision_metadata:
+            selected_row["fallback_eligible_candidate_count"] = int(decision_metadata["fallback_eligible_candidate_count"])
+            selected_row["fallback_filtered_candidate_count"] = int(decision_metadata["fallback_filtered_candidate_count"])
 
         selection_decision_path.parent.mkdir(parents=True, exist_ok=True)
         with selection_decision_path.open("w", encoding="utf-8") as fh:
@@ -708,27 +655,26 @@ def run_lambda_selection(config: dict[str, Any]) -> dict[str, Any]:
         "route_config_paths": [str(resolve_path(path, base_dir=base_dir) or path) for path in route_config_paths],
         "selected_config_paths": config_paths,
         "train_after_select": bool(config.get("train_after_select", False)),
-        "selection_strategy": selection_strategy,
-        "selection_strategy_tag": config.get("selection_strategy_tag"),
-        "selection_strategy_source": config.get("selection_strategy_source"),
+        SELECTION_POLICY_KEY: (
+            selected_rows[0][SELECTION_POLICY_KEY]
+            if selected_rows and len({row[SELECTION_POLICY_KEY] for row in selected_rows}) == 1
+            else "mode_dependent"
+        ),
+        "artifact_layout_version": ARTIFACT_LAYOUT_VERSION,
         "output_suffix": get_output_suffix(config),
-        "selection_default_strategy": DEFAULT_SELECTION_STRATEGY,
         "selection_sort_columns": list(SELECTION_SORT_COLUMNS),
         "selection_sort_ascending": list(SELECTION_SORT_ASCENDING),
         "selection_fallback_sort_columns": list(SELECTION_SORT_COLUMNS),
         "selection_fallback_sort_ascending": list(SELECTION_SORT_ASCENDING),
-        "selection_rules": {
-            "s1": {
-                "name": "AUC-first rule",
-                "nonzero_only": False,
-                "fallback_to_lambda_zero": True,
-                "sort_columns": list(SELECTION_SORT_COLUMNS),
-                "filter_type": SELECTION_FILTER_TYPE_NONE,
+        "selection_policy_definition": {
+            "classification_baseline": {
+                "rank_loss_mode": RANK_LOSS_MODE_DISABLED,
+                "fixed_lambda_rank": 0.0,
+                "uses_adaptive_lambda_selection": False,
             },
-            "s2": {
-                "name": "Balanced-first rule",
+            "primary_stage": {
+                "name": "S2 balanced baseline gate",
                 "nonzero_only": True,
-                "fallback_to_lambda_zero": True,
                 "sort_columns": list(SELECTION_SORT_COLUMNS),
                 "filter_type": SELECTION_FILTER_TYPE_BALANCED_BASELINE_GATE,
                 "baseline_requirements": {
@@ -737,6 +683,13 @@ def run_lambda_selection(config: dict[str, Any]) -> dict[str, Any]:
                     "f1_mean_gte_lambda_zero": True,
                     "kappa_mean_gte_lambda_zero": True,
                 },
+            },
+            "fallback_stage": {
+                "name": "S1 AUC-first fallback",
+                "trigger": "no eligible nonzero lambda after the primary stage",
+                "nonzero_only": False,
+                "sort_columns": list(SELECTION_SORT_COLUMNS),
+                "filter_type": SELECTION_FILTER_TYPE_NONE,
             },
         },
         "batch_size": int(config.get("batch_size")) if config.get("batch_size") is not None else None,
@@ -753,7 +706,7 @@ def run_lambda_selection(config: dict[str, Any]) -> dict[str, Any]:
     for item in selected_rows:
         print(
             f"Selected route={item['route']} lambda_rank={item['lambda_rank']} "
-            f"config={item['selected_config_path']}"
+            f"policy={item[SELECTION_POLICY_KEY]} config={item['selected_config_path']}"
         )
 
     return {
@@ -767,23 +720,16 @@ def run_lambda_selection(config: dict[str, Any]) -> dict[str, Any]:
 
 
 __all__ = [
-    "DEFAULT_SELECTION_STRATEGY",
+    "CLASSIFICATION_BASELINE_POLICY",
+    "SELECTION_POLICY",
     "SELECTION_SORT_ASCENDING",
     "SELECTION_SORT_COLUMNS",
     "_build_final_training_config",
     "_pick_best_candidate",
     "apply_lambda_rank_override",
-    "apply_selection_strategy_override",
-    "apply_selection_strategy_training_path_tagging",
+    "ensure_selection_policy_not_configurable",
     "get_lambda_rank",
-    "get_selection_strategy",
-    "get_selection_strategy_path_tag",
-    "get_selection_strategy_tag",
-    "get_selection_strategy_tag_aliases",
-    "merge_selection_strategy_metadata",
     "normalize_lambda_rank",
-    "normalize_selection_strategy",
+    "pick_classification_baseline_candidate_with_metadata",
     "run_lambda_selection",
-    "selection_strategy_to_tag",
-    "tag_selection_output_root",
 ]
