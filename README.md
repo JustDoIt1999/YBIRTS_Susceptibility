@@ -85,6 +85,10 @@ The pipeline script sequentially triggers the following three core commands:
 The pipeline script supports overriding parameters defined in the YAML files directly via CLI flags (convenient for testing and comparative experiments):
 * Override batch size: `--batch-size N` (e.g., `--batch-size 256`)
 * Override ranking loss mode: `--rank-loss-mode MODE` (e.g., `--rank-loss-mode ndcg_aware_lambdarank` or `disabled`)
+  * `ndcg_aware_lambdarank` searches the configured lambda grid and uses the fixed S2-first adaptive S1-fallback policy.
+  * `disabled` is a classification-only baseline: the workflow fixes `lambda_rank=0`, skips adaptive lambda selection, and writes the selected ensemble under the standard `.../disabled/selection/` layout for annual projection.
+* Safe resume: `--skip-existing` reuses only sweep runs whose configuration, training data, fold manifest, training-code fingerprint, and required artifacts still match.
+* Force rerun: `--no-skip-existing` retrains every requested sweep run instead of reusing previous metrics.
 
 #### 3. Execution Commands
 ```bash
@@ -100,7 +104,8 @@ Loads the 5-fold ensemble model and Scalers saved in Step 2, and performs tiled 
 
 #### 1. Preparation: Manually Editing the Configuration File
 Before running the projection, edit the configuration file [annual_projection.yaml](file:///Users/lipengfei/Documents/RTS_susceptibility_v4/Susceptibility_Mapping/configs/cvrank/annual_projection.yaml) to customize the prediction task:
-* `route` / `batch_size` / `selection_strategy`: Controls how the program automatically locates the optimal model outputs from Step 2.
+* `route` / `batch_size` / `rank_loss_mode`: Controls how the program automatically locates the optimal model outputs from Step 2. `ndcg_aware_lambdarank` uses the fixed S2-first adaptive policy: nonzero candidates must first match or exceed the lambda-zero baseline on ROC-AUC, accuracy, F1, and kappa; when none qualify, selection falls back to the AUC-first rule. `disabled` resolves the fixed-lambda classification baseline from the `disabled` artifact directory.
+* `train_output_suffix`: Leave this as `null` for the normal training output. Set it only when Step 2 was run with `--output-suffix NAME`; use the same `NAME` here so projection resolves `output_<route>_selected_<NAME>/bs_<batch_size>/<rank_loss_mode>/...`.
 * `years`: Specifies the target years for mapping (e.g., 2016-2022).
 * `download_workers`: The number of concurrent threads used to download data.
 
