@@ -252,7 +252,7 @@ def build_job_preview(job: dict[str, Any]) -> dict[str, Any]:
         "note": (
             "The annual pipeline reads the official annual GEE assets. "
             "Specifically, 2016-2020 reads from factor_library_v2/dynamic_annual, "
-            "and 2021-2022 reads from prediction_factor_library_v1/dynamic_annual. "
+            "and 2021-2025 reads from prediction_factor_library_v1/dynamic_annual. "
             "When download_only=True, it only downloads the annual tile cache without running inference, generating TIFs, or requiring model weights."
         ),
         "ee_runtime": ee_ctx.build_runtime_summary(ee_endpoint_mode=job["ee_endpoint_mode"]),
