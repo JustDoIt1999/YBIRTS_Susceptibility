@@ -17,6 +17,9 @@ years:
   - 2020
   - 2021
   - 2022
+  - 2023
+  - 2024
+  - 2025
 
 # output
 raster_output_dir: ../../output/tif/annual
