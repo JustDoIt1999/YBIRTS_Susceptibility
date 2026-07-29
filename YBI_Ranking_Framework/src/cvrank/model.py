@@ -89,7 +89,7 @@ class MLPBackbone(nn.Module):
         layers: list[nn.Module] = []
         normalized_dropout_mode = normalize_dropout_mode(dropout_mode)
         normalized_batch_norm_mode = normalize_batch_norm_mode(batch_norm_mode)
-        for layer_index, (left, right) in enumerate(zip(dims[:-1], dims[1:], strict=False)):
+        for layer_index, (left, right) in enumerate(zip(dims[:-1], dims[1:])):
             layers.append(nn.Linear(left, right))
             if should_apply_batch_norm(normalized_batch_norm_mode, layer_index):
                 layers.append(nn.BatchNorm1d(right))
