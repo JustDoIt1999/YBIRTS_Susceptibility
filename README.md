@@ -106,7 +106,7 @@ Loads the 5-fold ensemble model and Scalers saved in Step 2, and performs tiled 
 Before running the projection, edit the configuration file [annual_projection.yaml](file:///Users/lipengfei/Documents/RTS_susceptibility_v4/Susceptibility_Mapping/configs/cvrank/annual_projection.yaml) to customize the prediction task:
 * `route` / `batch_size` / `rank_loss_mode`: Controls how the program automatically locates the optimal model outputs from Step 2. `ndcg_aware_lambdarank` uses the fixed S2-first adaptive policy: nonzero candidates must first match or exceed the lambda-zero baseline on ROC-AUC, accuracy, F1, and kappa; when none qualify, selection falls back to the AUC-first rule. `disabled` resolves the fixed-lambda classification baseline from the `disabled` artifact directory.
 * `train_output_suffix`: Leave this as `null` for the normal training output. Set it only when Step 2 was run with `--output-suffix NAME`; use the same `NAME` here so projection resolves `output_<route>_selected_<NAME>/bs_<batch_size>/<rank_loss_mode>/...`.
-* `years`: Specifies the target years for mapping (e.g., 2016-2022).
+* `years`: Specifies the target years for mapping (e.g., 2016-2025).
 * `download_workers`: The number of concurrent threads used to download data.
 
 #### 2. Advanced Features of the Mapping Engine
