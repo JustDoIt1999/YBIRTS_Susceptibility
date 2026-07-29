@@ -232,19 +232,29 @@ def current_ee_runtime_config() -> dict[str, Any]:
     }
 
 
+def _is_dataset_construction_root(root: Path) -> bool:
+    return (
+        root.is_dir()
+        and (root / "inputs").is_dir()
+        and (root / "src" / "dataset_construction").is_dir()
+    )
+
+
 def resolve_data_root() -> Path:
-    """Compatible with starting from the data root directory, environmental_data, or its parent directories."""
-    here = Path.cwd().resolve()
-    candidates = [here, *here.parents]
-    for p in candidates:
-        for root in (p, p / "Dataset_Construction"):
-            if (root / "03_environmental_data").is_dir() and (root / "00_inputs").is_dir():
-                return root
+    """Locate the current Dataset_Construction root without relying on the launch directory."""
     module_root = Path(__file__).resolve().parents[1] / "Dataset_Construction"
-    if (module_root / "03_environmental_data").is_dir() and (module_root / "00_inputs").is_dir():
+    if _is_dataset_construction_root(module_root):
         return module_root
+
+    here = Path.cwd().resolve()
+    for candidate in [here, *here.parents]:
+        for root in (candidate, candidate / "Dataset_Construction"):
+            if _is_dataset_construction_root(root):
+                return root
+
     raise FileNotFoundError(
-        "Could not locate the Dataset_Construction root directory. Please check that the current working directory is near the data root, environmental_data, or its parents."
+        "Could not locate the Dataset_Construction root directory. "
+        "Expected to find both `inputs/` and `src/dataset_construction/`."
     )
 
 
