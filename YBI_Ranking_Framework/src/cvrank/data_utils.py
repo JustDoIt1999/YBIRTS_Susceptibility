@@ -406,7 +406,7 @@ def apply_feature_preparation_artifact(
             if valid_mask.any():
                 category_tokens.loc[valid_mask] = normalized_feature.loc[valid_mask].map(_canonicalize_categorical_token)
 
-            for token, output_column in zip(categories, output_columns, strict=False):
+            for token, output_column in zip(categories, output_columns):
                 transformed[output_column] = category_tokens.eq(token).astype(float)
             continue
 
