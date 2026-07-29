@@ -63,3 +63,6 @@ table/
 # !table/**/*.csv
 # !table/**/*.xlsx
 # !table/**/*.pdf
+
+
+GRL/
