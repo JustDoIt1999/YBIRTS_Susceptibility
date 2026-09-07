@@ -16,6 +16,7 @@ plotly==6.3.0
 
 # Spatial & Geospatial Data
 rasterio==1.4.3
+pyproj>=3.6
 earthengine-api==1.7.21
 geemap==0.37.1
 

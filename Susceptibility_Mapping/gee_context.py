@@ -25,7 +25,9 @@ MAX_ERROR = 1000
 
 CURRENT_STATIC_EXPORT_FEATURE_COLS = [
     "Slope",
-    "Aspect",
+    "Slope_std",
+    "Northness",
+    "Eastness",
     "TWI",
     "Local_Relief",
     "Soil",
@@ -34,7 +36,9 @@ CURRENT_STATIC_EXPORT_FEATURE_COLS = [
 ]
 CURRENT_RANK_FEATURE_COLS = [
     "Slope",
-    "Aspect",
+    "Slope_std",
+    "Northness",
+    "Eastness",
     "TWI",
     "Local_Relief",
     "Soil",
@@ -50,7 +54,10 @@ CURRENT_RANK_FEATURE_COLS = [
 ]
 ASSET_DTYPE_BY_BAND = {
     "Slope": "float32",
-    "Aspect": "int16",
+    "Slope_std": "float32",
+    "Aspect": "float32",
+    "Northness": "float32",
+    "Eastness": "float32",
     "TWI": "float32",
     "Local_Relief": "float32",
     "Soil": "float32",
@@ -67,10 +74,13 @@ ASSET_DTYPE_BY_BAND = {
 
 STATIC_FACTOR_SPECS = [
     {"factor_name": "Slope", "band_name": "Slope"},
-    {"factor_name": "Aspect", "band_name": "Aspect"},
+    {"factor_name": "Slope_std", "band_name": "Slope_std", "source_factor": "Slope"},
+    {"factor_name": "Northness", "band_name": "Northness", "source_factor": "Aspect"},
+    {"factor_name": "Eastness", "band_name": "Eastness", "source_factor": "Aspect"},
     {"factor_name": "TWI", "band_name": "TWI"},
     {"factor_name": "Local_Relief", "band_name": "Local_Relief", "asset_name": "Local_Relief_5km"},
     {"factor_name": "Soil", "band_name": "Soil"},
+    {"factor_name": "Vegetation_type", "band_name": "Vegetation_type"},
     {"factor_name": "GIC", "band_name": "GIC"},
 ]
 DYNAMIC_ANNUAL_FACTOR_SPECS = [
@@ -326,7 +336,16 @@ def factor_asset_name(group: str, factor_name: str, year: int | None = None) -> 
             (item for item in STATIC_FACTOR_SPECS if item["factor_name"] == normalized_factor),
             None,
         )
-        asset_name = str((factor_spec or {}).get("asset_name") or normalized_factor)
+        source_factor = str((factor_spec or {}).get("source_factor") or normalized_factor)
+        source_spec = next(
+            (item for item in STATIC_FACTOR_SPECS if item["factor_name"] == source_factor),
+            None,
+        )
+        asset_name = str(
+            (factor_spec or {}).get("asset_name")
+            or (source_spec or {}).get("asset_name")
+            or source_factor
+        )
         return f"{asset_name}_{FACTOR_LIBRARY_VERSION_TAG}"
     raise ValueError(f"Unsupported factor asset group: {group}")
 
@@ -345,11 +364,33 @@ def load_factor_asset_image(asset_id: str, expected_band: str, *, label: str) ->
 def _load_static_factor_stack_from_assets(feature_cols: list[str]) -> ee.Image:
     stack = None
     for band_name in feature_cols:
+        spec = next((item for item in STATIC_FACTOR_SPECS if item["factor_name"] == band_name), None)
+        if spec is None:
+            raise ValueError(f"Unsupported static projection feature: {band_name}")
+        source_factor = str(spec.get("source_factor") or band_name)
+        source_band = source_factor if source_factor in {"Slope", "Aspect"} else band_name
         image = load_factor_asset_image(
-            factor_asset_id("static", band_name),
-            band_name,
+            factor_asset_id("static", source_factor),
+            source_band,
             label=f"static factor {band_name}",
         )
+        if band_name == "Slope_std":
+            # Slope_std is a slope-unit statistic, not a standalone raster
+            # asset.  Keep the source slope pixels here so the later SU zonal
+            # reducer can compute stdDev over the complete polygon.
+            image = image.rename(["Slope_std"]).toFloat()
+        elif band_name == "Northness":
+            image = image.remap(
+                [0, 2, 3, 4, 5, 6, 7, 8, 9],
+                [0.0, 1.0, 0.7071, 0.0, -0.7071, -1.0, -0.7071, 0.0, 0.7071],
+                0.0,
+            ).rename(["Northness"]).toFloat()
+        elif band_name == "Eastness":
+            image = image.remap(
+                [0, 2, 3, 4, 5, 6, 7, 8, 9],
+                [0.0, 0.0, 0.7071, 1.0, 0.7071, 0.0, -0.7071, -1.0, -0.7071],
+                0.0,
+            ).rename(["Eastness"]).toFloat()
         stack = image if stack is None else stack.addBands(image)
     return cast_stack_for_asset(ee.Image(stack).select(feature_cols), feature_cols)
 

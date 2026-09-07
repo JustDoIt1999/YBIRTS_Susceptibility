@@ -6,7 +6,9 @@ SMDP_ASSET_VERSION_SUFFIX = "_v2"
 
 STATIC_FACTOR_SPECS = [
     {"factor_name": "Slope", "band_name": "Slope"},
-    {"factor_name": "Aspect", "band_name": "Aspect"},
+    {"factor_name": "Slope_std", "band_name": "Slope_std", "source_factor": "Slope"},
+    {"factor_name": "Northness", "band_name": "Northness", "source_factor": "Aspect"},
+    {"factor_name": "Eastness", "band_name": "Eastness", "source_factor": "Aspect"},
     {"factor_name": "TWI", "band_name": "TWI"},
     {"factor_name": "Local_Relief", "band_name": "Local_Relief", "asset_name": "Local_Relief_5km"},
     {"factor_name": "Soil", "band_name": "Soil"},
@@ -30,7 +32,10 @@ RANK_FEATURE_OUTPUT_COLUMNS = [*RANK_STATIC_FEATURE_COLUMNS, *RANK_DYNAMIC_FEATU
 
 ASSET_DTYPE_BY_BAND = {
     "Slope": "float32",
-    "Aspect": "int16",
+    "Slope_std": "float32",
+    "Aspect": "float32",
+    "Northness": "float32",
+    "Eastness": "float32",
     "TWI": "float32",
     "Local_Relief": "float32",
     "Soil": "float32",

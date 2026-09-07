@@ -185,6 +185,11 @@ def selected_training_artifacts_complete(selection_manifest_path: Path, expected
         manifest = json.loads(selection_manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
+    # The full workflow now materializes the selected sweep artifacts by
+    # default.  Do not treat a legacy or explicitly retrained manifest as a
+    # valid reusable result.
+    if manifest.get("post_selection_action") != "use_sweep_artifacts":
+        return False
     selected_routes = manifest.get("selected_routes")
     if not isinstance(selected_routes, list):
         return False
@@ -214,6 +219,17 @@ def selected_training_artifacts_complete(selection_manifest_path: Path, expected
         )
         required_paths = [Path(str(train_config.get(key) or "")) for key in required_keys]
         if not all(path.exists() and path.is_file() for path in required_paths):
+            return False
+        try:
+            fold_manifest = json.loads(required_paths[-1].read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if not isinstance(fold_manifest, dict) or fold_manifest.get("artifact_source") != "lambda_sweep":
+            return False
+        fold_records = fold_manifest.get("folds")
+        if not isinstance(fold_records, list) or not fold_records or not all(isinstance(record, dict) for record in fold_records):
+            return False
+        if any(record.get("artifact_source") != "lambda_sweep" for record in fold_records):
             return False
     return True
 
@@ -392,17 +408,16 @@ def main(argv: list[str] | None = None) -> int:
             "select-lambda",
             "--config",
             str(select_config_to_run),
-            "--train",
             *select_extra_args,
         ]
 
         selection_manifest_path = selection_root / "selection_manifest.json"
         if bool(args.skip_existing) and selected_training_artifacts_complete(selection_manifest_path, routes_to_run):
             print()
-            print("==> skip (select-lambda (train))")
+            print("==> skip (select-lambda)")
             print(f"    complete manifest: {selection_manifest_path}")
         else:
-            run_step("select-lambda (train)", select_command)
+            run_step("select-lambda", select_command)
     finally:
         if temp_sweep_yaml is not None and temp_sweep_yaml.exists():
             temp_sweep_yaml.unlink()

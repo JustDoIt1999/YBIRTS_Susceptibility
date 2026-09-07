@@ -19,7 +19,8 @@ Workflow configuration file:
 
 Responsibilities:
 
-- Runs the three core YBI_Ranking_Framework stages in sequence: `make-folds` -> `sweep-lambda` -> `select-lambda --train`
+- Runs the three core YBI_Ranking_Framework stages in sequence: `make-folds` -> `sweep-lambda` -> `select-lambda`
+- `select-lambda` uses the already-trained artifacts for the selected lambda by default; fresh fitting requires the explicit `--retrain` flag.
 - Supports `--skip-existing` for safe resume behavior and automatic reuse of completed work
 - Supports command-line overrides such as `--batch-size` and `--rank-loss-mode`
 - When `--rank-loss-mode disabled` is used, the workflow trains the classification baseline with a fixed `lambda_rank=0`, skips adaptive S2/S1 lambda selection, and writes the selected five-fold ensemble to the standard `disabled/selection` artifact directory

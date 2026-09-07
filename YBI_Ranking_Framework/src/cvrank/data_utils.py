@@ -247,9 +247,7 @@ def _canonicalize_categorical_token(value: Any) -> str:
     if not np.isfinite(numeric):
         return DEFAULT_CATEGORICAL_MISSING_TOKEN
     rounded = round(numeric)
-    if abs(numeric - rounded) < 1e-9:
-        return str(int(rounded))
-    return format(numeric, ".12g")
+    return str(int(rounded))
 
 
 def _build_categorical_output_column_name(feature_name: str, token: str) -> str:

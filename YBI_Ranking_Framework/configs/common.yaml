@@ -4,4 +4,18 @@ seed: 42
 n_splits: 5
 group_col: Sample_ID
 stratify_mode: year_plus_label
-split_strategy: stratified_group_kfold
+split_strategy: spatial_block_cv
+spatial_x_col: Longitude
+spatial_y_col: Latitude
+spatial_source_crs: EPSG:4326
+spatial_target_crs: qtp_albers
+# null lets make-folds derive the square block edge from continuous-feature variograms.
+spatial_block_size_m: null
+spatial_variogram_n_lags: 20
+spatial_variogram_max_pairs: 200000
+spatial_variogram_min_pairs_per_lag: 30
+spatial_variogram_sample_size: 5000
+spatial_block_origin_x_m: 0.0
+spatial_block_origin_y_m: 0.0
+spatial_min_blocks_per_fold: 5
+spatial_max_fold_size_imbalance: 0.2

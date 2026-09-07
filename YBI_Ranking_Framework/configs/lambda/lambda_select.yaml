@@ -7,4 +7,3 @@ route_config_paths:
   - ./configs/routes/no_cluster.yaml
   - ./configs/routes/basin.yaml
 output_root: ./data/output/selected_lambda
-train_after_select: false

@@ -25,6 +25,7 @@ from .output_suffix import (
     apply_output_suffix_path_tagging,
     normalize_output_suffix,
 )
+from .run_fingerprint import FileHashCache, describe_file
 from .selection import run_lambda_selection
 from .shared import build_fold_training_config, numeric_mean_std, save_json
 from .split import build_fold_manifest_from_config, save_manifest, save_manifest_cleaning_audit, summarize_manifest
@@ -182,6 +183,17 @@ def _default_sweep_runs_csv_from_summary(summary_csv: Path) -> Path:
     return summary_csv.with_name("lambda_sweep_runs.csv")
 
 
+def _has_csv_value(value: Any) -> bool:
+    if value is None:
+        return False
+    try:
+        if bool(pd.isna(value)):
+            return False
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip() != ""
+
+
 def _load_selected_sweep_rows(selected: dict[str, Any], train_cfg: dict[str, Any]) -> dict[int, dict[str, Any]] | None:
     summary_csv_raw = selected.get("source_summary_csv")
     if summary_csv_raw in (None, ""):
@@ -219,11 +231,25 @@ def _load_selected_sweep_rows(selected: dict[str, Any], train_cfg: dict[str, Any
     if filtered.empty:
         return None
 
-    if batch_size_tag not in (None, "") and "batch_size_tag" in filtered.columns:
-        batch_series = filtered["batch_size_tag"].astype(str)
-        filtered = filtered[batch_series == str(batch_size_tag)].copy()
-        if filtered.empty:
-            return None
+    if batch_size_tag not in (None, ""):
+        # Older sweep manifests may not have populated ``batch_size_tag`` even
+        # though they do contain the numeric batch size.  Prefer the explicit
+        # tag, then fall back to the numeric value; never silently accept a
+        # different batch size.
+        tagged = pd.DataFrame()
+        if "batch_size_tag" in filtered.columns:
+            batch_series = filtered["batch_size_tag"].astype(str).str.strip()
+            tagged = filtered[batch_series == str(batch_size_tag)].copy()
+        if not tagged.empty:
+            filtered = tagged
+        else:
+            expected_batch_size = pd.to_numeric(pd.Series([train_cfg.get("batch_size")]), errors="coerce").iloc[0]
+            if pd.isna(expected_batch_size) or "batch_size" not in filtered.columns:
+                return None
+            numeric_batch = pd.to_numeric(filtered["batch_size"], errors="coerce")
+            filtered = filtered[numeric_batch == float(expected_batch_size)].copy()
+            if filtered.empty:
+                return None
 
     rows_by_fold: dict[int, dict[str, Any]] = {}
     for row in filtered.to_dict(orient="records"):
@@ -262,6 +288,7 @@ def _promote_selected_training_from_sweep(selected: dict[str, Any], train_cfg: d
     fold_validation_metrics: list[dict[str, Any]] = []
     combined_history_rows: list[dict[str, Any]] = []
     base_metrics_payload: dict[str, Any] | None = None
+    hash_cache = FileHashCache()
 
     for fold_index in requested_folds:
         row = sweep_rows[int(fold_index)]
@@ -286,6 +313,23 @@ def _promote_selected_training_from_sweep(selected: dict[str, Any], train_cfg: d
         if not source_validation_path.exists() or not source_feature_preparation_path.exists():
             return None
 
+        source_completion_raw = row.get("run_completion_path")
+        source_completion_path = (
+            Path(str(source_completion_raw)).resolve()
+            if _has_csv_value(source_completion_raw)
+            else None
+        )
+        if source_completion_path is not None:
+            if not source_completion_path.exists():
+                return None
+            try:
+                with source_completion_path.open("r", encoding="utf-8") as fh:
+                    source_completion = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                return None
+            if not isinstance(source_completion, dict) or source_completion.get("status") != "complete":
+                return None
+
         with source_validation_path.open("r", encoding="utf-8") as fh:
             source_validation = json.load(fh)
         history_df = pd.read_csv(source_history_path)
@@ -303,8 +347,23 @@ def _promote_selected_training_from_sweep(selected: dict[str, Any], train_cfg: d
         _copy_promoted_file(source_feature_preparation_path, dest_feature_preparation_path)
 
         dest_history_path.parent.mkdir(parents=True, exist_ok=True)
-        history_df.to_csv(dest_history_path, index=False)
+        _copy_promoted_file(source_history_path, dest_history_path)
         combined_history_rows.extend({"fold_index": int(fold_index), **row_data} for row_data in history_df.to_dict(orient="records"))
+
+        source_artifact_paths = {
+            "model": source_model_path,
+            "scaler": source_scaler_path,
+            "feature_preparation": source_feature_preparation_path,
+            "metrics": source_metrics_path,
+            "validation_metrics": source_validation_path,
+            "history": source_history_path,
+        }
+        source_artifacts = {
+            key: describe_file(path, hash_cache)
+            for key, path in source_artifact_paths.items()
+        }
+        if source_completion_path is not None:
+            source_artifacts["run_completion"] = describe_file(source_completion_path, hash_cache)
 
         promoted_metrics = dict(source_metrics)
         promoted_metrics.update(
@@ -343,6 +402,20 @@ def _promote_selected_training_from_sweep(selected: dict[str, Any], train_cfg: d
                 "validation_metrics_path": promoted_metrics["validation_metrics_path"],
                 "history_path": promoted_metrics["history_path"],
                 "feature_preparation_path": promoted_metrics["feature_preparation_path"],
+                "artifact_source": "lambda_sweep",
+                "source_run_root": (
+                    str(Path(str(row.get("run_dir"))).resolve())
+                    if _has_csv_value(row.get("run_dir"))
+                    else str(source_model_path.parent.parent)
+                ),
+                "source_run_completion_path": str(source_completion_path) if source_completion_path is not None else None,
+                "source_artifacts": source_artifacts,
+                "destination_artifacts": {
+                    "model": describe_file(dest_model_path, hash_cache),
+                    "scaler": describe_file(dest_scaler_path, hash_cache),
+                    "feature_preparation": describe_file(dest_feature_preparation_path, hash_cache),
+                    "history": describe_file(dest_history_path, hash_cache),
+                },
                 "best_epoch": promoted_metrics["best_epoch"],
                 "best_val_loss_proxy": promoted_metrics["best_val_loss_proxy"],
                 "best_eval": promoted_metrics["best_eval"],
@@ -399,6 +472,15 @@ def _promote_selected_training_from_sweep(selected: dict[str, Any], train_cfg: d
         "metrics_path": str(metrics_path),
         "validation_metrics_path": str(validation_metrics_path),
         "history_path": str(history_path),
+        "artifact_source": "lambda_sweep",
+        "source_summary_csv": str(selected.get("source_summary_csv")) if selected.get("source_summary_csv") else None,
+        "source_runs_csv": (
+            str(_default_sweep_runs_csv_from_summary(Path(str(selected["source_summary_csv"]))))
+            if selected.get("source_summary_csv")
+            else None
+        ),
+        "lambda_rank": float(selected["lambda_rank"]),
+        "rank_loss_mode": str(selected["rank_loss_mode"]),
         "folds": fold_entries,
     }
     save_json(fold_runs_manifest_path, fold_runs_manifest)
@@ -446,6 +528,7 @@ def _promote_selected_training_from_sweep(selected: dict[str, Any], train_cfg: d
     return {
         "reused_existing_training": True,
         "promoted_from_sweep": True,
+        "post_selection_action": "use_sweep_artifacts",
         "selected_run_root": str(selected_run_root),
         "fold_runs_manifest_path": str(fold_runs_manifest_path),
         "metrics_path": str(metrics_path),
@@ -456,64 +539,50 @@ def _promote_selected_training_from_sweep(selected: dict[str, Any], train_cfg: d
     }
 
 
-def _run_select_and_train(config: dict[str, Any]) -> dict[str, Any]:
-    selection_result = run_lambda_selection(config)
-    if not config.get("train_after_select", False):
-        return selection_result
+def _run_select_and_train(config: dict[str, Any], *, retrain: bool = False) -> dict[str, Any]:
+    """Select λ and either materialize sweep artifacts or explicitly retrain.
 
-    def _final_training_outputs_complete(train_cfg: dict[str, Any]) -> bool:
-        required_paths = [
-            Path(str(train_cfg["metrics_path"])),
-            Path(str(train_cfg["validation_metrics_path"])),
-            Path(str(train_cfg["history_path"])),
-        ]
-        requested_folds = resolve_requested_fold_indices(train_cfg, train_cfg.get("split_manifest_path"))
-        if requested_folds and len(requested_folds) > 1:
-            required_paths.append(Path(str(train_cfg["fold_runs_manifest_path"])))
-        else:
-            required_paths.extend(
-                [
-                    Path(str(train_cfg["model_path"])),
-                    Path(str(train_cfg["scaler_path"])),
-                ]
-            )
-        return all(path.exists() for path in required_paths)
+    The CLI's default post-selection action is artifact reuse.  Fresh model
+    fitting is opt-in via ``--retrain`` and must never be reached through a
+    fallback when sweep artifacts are missing.
+    """
+    selection_result = run_lambda_selection(config)
 
     train_results: list[dict[str, Any]] = []
     for selected in selection_result.get("selected_configs", []):
         train_cfg = dict(selected["config"])
-        selected_run_root = Path(str(selected["selected_run_root"]))
-        reused_existing_training = bool(selected.get("selected_config_unchanged")) and _final_training_outputs_complete(train_cfg)
-        promoted_from_sweep = False
-        if reused_existing_training:
-            train_result: dict[str, Any] = {
-                "reused_existing_training": True,
-                "selected_config_unchanged": True,
-                "selected_run_root": str(selected_run_root),
-                "fold_runs_manifest_path": str(train_cfg.get("fold_runs_manifest_path")) if train_cfg.get("fold_runs_manifest_path") else None,
-                "metrics_path": str(train_cfg.get("metrics_path")) if train_cfg.get("metrics_path") else None,
-                "validation_metrics_path": str(train_cfg.get("validation_metrics_path")) if train_cfg.get("validation_metrics_path") else None,
-                "history_path": str(train_cfg.get("history_path")) if train_cfg.get("history_path") else None,
-            }
+        if retrain:
+            # This is the only code path that is allowed to fit new models.
+            train_result = run_training(train_cfg)
+            training_reused = False
+            promoted_from_sweep = False
         else:
             promoted_result = _promote_selected_training_from_sweep(selected, train_cfg)
-            if promoted_result is not None:
-                train_result = promoted_result
-                promoted_from_sweep = True
-            else:
-                train_result = run_training(train_cfg)
+            if promoted_result is None:
+                route = str(selected.get("route", "")).strip().lower()
+                lambda_rank = selected.get("lambda_rank")
+                raise RuntimeError(
+                    "Selected sweep artifacts are incomplete for "
+                    f"route={route!r}, lambda_rank={lambda_rank!r}; refusing implicit retraining. "
+                    "Use `select-lambda --retrain` to explicitly train fresh models."
+                )
+            train_result = promoted_result
+            training_reused = True
+            promoted_from_sweep = True
         train_results.append(
             {
                 "route": selected["route"],
                 "lambda_rank": float(selected["lambda_rank"]),
                 "config_path": selected["selected_config_path"],
-                "training_reused": reused_existing_training or promoted_from_sweep,
+                "training_reused": training_reused,
                 "promoted_from_sweep": promoted_from_sweep,
+                "post_selection_action": "retrain" if retrain else "use_sweep_artifacts",
                 "selected_config_unchanged": bool(selected.get("selected_config_unchanged")),
                 "train_result": train_result,
             }
         )
     selection_result["training_results"] = train_results
+    selection_result["post_selection_action"] = "retrain" if retrain else "use_sweep_artifacts"
     return selection_result
 
 
@@ -528,10 +597,15 @@ def _run_command_handler(args: argparse.Namespace, cfg: dict[str, Any], base_dir
         return _run_with_metadata(base_dir, "sweep_lambda", sweep_cfg, lambda: run_lambda_sweep(sweep_cfg))
     if args.command == "select-lambda":
         select_cfg = dict(cfg)
-        select_cfg["train_after_select"] = bool(args.train) or bool(select_cfg.get("train_after_select", False))
         select_cfg = apply_batch_size_path_tagging(select_cfg)
-        runner = _run_select_and_train if select_cfg.get("train_after_select", False) else run_lambda_selection
-        return _run_with_metadata(base_dir, "select_lambda", select_cfg, lambda: runner(select_cfg))
+        retrain = bool(args.retrain)
+        select_cfg["post_selection_action"] = "retrain" if retrain else "use_sweep_artifacts"
+        return _run_with_metadata(
+            base_dir,
+            "select_lambda",
+            select_cfg,
+            lambda: _run_select_and_train(select_cfg, retrain=retrain),
+        )
     raise ValueError(f"Unknown command: {args.command}")
 
 
@@ -562,6 +636,7 @@ def _run_make_folds(args: argparse.Namespace, base_dir: Path) -> tuple[Any, bool
             result.dropped_rows_audit,
             data_path=cfg.get("data_path"),
             manifest=result.manifest,
+            split_metadata=result.split_metadata,
         )
         preview = list(result.prepared.dropped_row_indices_preview)
         print(f"[make-folds] route={result.prepared.route} manifest={manifest_path}")
@@ -571,6 +646,13 @@ def _run_make_folds(args: argparse.Namespace, base_dir: Path) -> tuple[Any, bool
             f"dropped_rows={result.prepared.dropped_rows} "
             f"row_index_preview={preview}"
         )
+        split_strategy = result.split_metadata.get("split_strategy", cfg.get("split_strategy"))
+        block_size = result.split_metadata.get("spatial_block_size_m")
+        split_detail = f"split_strategy={split_strategy}"
+        if block_size is not None:
+            split_detail += f" spatial_block_size_m={float(block_size):.3f}"
+            split_detail += f" source={result.split_metadata.get('spatial_block_size_source', 'unknown')}"
+        print(f"[make-folds] {split_detail}")
         print(
             "[make-folds] "
             f"cleaning_summary={audit_paths['summary_path']} "
@@ -581,6 +663,7 @@ def _run_make_folds(args: argparse.Namespace, base_dir: Path) -> tuple[Any, bool
             "cleaning_summary_path": str(audit_paths["summary_path"]),
             "dropped_rows_path": str(audit_paths["dropped_rows_path"]),
             "clean_row_count": int(len(result.prepared.frame)),
+            "split_metadata": result.split_metadata,
             **result.prepared.metadata(),
         }
 
@@ -627,7 +710,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="cvrank CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    make_folds = subparsers.add_parser("make-folds", help="Generate StratifiedGroupKFold manifests.")
+    make_folds = subparsers.add_parser("make-folds", help="Generate configured cross-validation manifests.")
     _apply_common_args(make_folds, ["config"])
     make_folds.add_argument("--output", type=str, default=None, help="Optional output CSV path.")
 
@@ -671,13 +754,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     select_lambda = subparsers.add_parser(
         "select-lambda",
-        help="Select the best lambda_rank from sweep summaries and optionally train final models.",
+        help=(
+            "Select the best lambda_rank and materialize the matching sweep artifacts "
+            "(default); use --retrain to fit fresh final models."
+        ),
     )
     _apply_common_args(select_lambda, ["config", "batch_size", "rank_loss_mode", "output_suffix"])
     select_lambda.add_argument(
-        "--train",
+        "--retrain",
         action="store_true",
-        help="Train the selected final configs after selection.",
+        help="Explicitly retrain fresh final models after selecting lambda_rank.",
     )
 
     return parser

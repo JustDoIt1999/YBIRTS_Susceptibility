@@ -12,6 +12,7 @@ dependencies = [
   "numpy",
   "pandas",
   "scikit-learn",
+  "pyproj>=3.6",
   "pyyaml",
   "pytest",
   "torch",

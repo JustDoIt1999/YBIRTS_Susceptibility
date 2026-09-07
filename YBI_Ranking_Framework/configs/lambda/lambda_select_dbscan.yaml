@@ -1,0 +1,7 @@
+project_name: cvrank
+selection_name: lambda_rank_dbscan_best_selection
+base_dir: ../..
+summary_csv: ./data/output/sweeps/lambda_rank_dbscan/lambda_sweep_summary.csv
+route_config_paths:
+  - ./configs/routes/dbscan.yaml
+output_root: ./data/output/selected_lambda_dbscan

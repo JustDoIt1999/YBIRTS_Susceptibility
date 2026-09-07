@@ -161,6 +161,7 @@ def apply_batch_size_path_tagging(config: dict[str, Any]) -> dict[str, Any]:
         return tagged
 
     old_output_root = Path(str(tagged["output_root"])) if tagged.get("output_root") else None
+    output_root_already_tagged = old_output_root is not None and batch_size_tag in old_output_root.parts
     new_output_root = tag_directory_path(old_output_root, batch_size_tag) if old_output_root is not None else None
 
     if new_output_root is not None:
@@ -185,7 +186,7 @@ def apply_batch_size_path_tagging(config: dict[str, Any]) -> dict[str, Any]:
 
         if not changed:
             rewritten = tag_directory_path(path.parent, batch_size_tag) / tag_file_path(path.name, batch_size_tag)
-        else:
+        elif not output_root_already_tagged:
             rewritten = tag_file_path(rewritten, batch_size_tag)
         tagged[key] = str(rewritten)
 

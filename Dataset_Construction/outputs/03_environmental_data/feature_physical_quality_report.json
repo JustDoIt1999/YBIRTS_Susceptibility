@@ -1,0 +1,43 @@
+{
+  "status": "pass",
+  "row_count": 5893,
+  "nodata_value": -9999.0,
+  "nodata_counts": {
+    "Slope": 0,
+    "Slope_std": 4,
+    "Northness": 0,
+    "Eastness": 0,
+    "TWI": 0,
+    "Local_Relief": 0,
+    "Soil": 20,
+    "GIC": 0,
+    "Vegetation_type": 59,
+    "TDD": 0,
+    "SMDP": 0,
+    "Precipitation": 0,
+    "WSTmax": 0,
+    "WSRH": 0,
+    "NDVI": 0,
+    "Summer_SoilMoisture": 0
+  },
+  "physical_invalid_by_feature": {
+    "Slope": 0,
+    "Slope_std": 0,
+    "Northness": 0,
+    "Eastness": 0,
+    "TWI": 0,
+    "Local_Relief": 0,
+    "Soil": 0,
+    "GIC": 0,
+    "Vegetation_type": 0,
+    "TDD": 0,
+    "SMDP": 0,
+    "Precipitation": 0,
+    "WSTmax": 0,
+    "WSRH": 0,
+    "NDVI": 0,
+    "Summer_SoilMoisture": 0
+  },
+  "physical_invalid_rows": 0,
+  "physical_invalid_sample_preview": []
+}

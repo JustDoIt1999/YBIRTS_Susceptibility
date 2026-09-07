@@ -8,7 +8,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
-from IPython.display import display
+import pandas as pd
+try:
+    from IPython.display import display
+except ImportError:
+    display = print
 
 from dataset_construction.common import python_output_root, resolve_dataset_construction_root
 
@@ -16,7 +20,8 @@ from dataset_construction.common import python_output_root, resolve_dataset_cons
 
 DATA_ROOT = resolve_dataset_construction_root(Path.cwd())
 PYTHON_OUTPUT_ROOT = python_output_root(DATA_ROOT)
-POSITIVE_PATH = DATA_ROOT / "inputs" / "positive_samples.csv"
+POSITIVE_SU_PATH = PYTHON_OUTPUT_ROOT / "01_pa_sampling" / "positive_su.csv"
+POSITIVE_PATH = POSITIVE_SU_PATH if POSITIVE_SU_PATH.exists() else DATA_ROOT / "inputs" / "positive_samples.csv"
 PA_PATH = PYTHON_OUTPUT_ROOT / "01_pa_sampling" / "pseudo_absence_random.csv"
 OUTPUT_PATH = PYTHON_OUTPUT_ROOT / "02_sample_tables" / "RTS_Total_sample.csv"
 
@@ -32,11 +37,14 @@ print({
 
 # ## Standardize The Two Inputs
 
-positive_required = {"RTS_ID", "Longitude", "Latitude", "Cluster", "Basin_cluster", "Year", "Label_Cls"}
-pa_required = {"PA_ID", "Longitude", "Latitude", "Year"}
-
 positive_df = pd.read_csv(POSITIVE_PATH)
 pa_df = pd.read_csv(PA_PATH)
+
+if "Sample_ID" not in positive_df.columns and "RTS_ID" in positive_df.columns:
+    positive_df = positive_df.rename(columns={"RTS_ID": "Sample_ID"})
+
+positive_required = {"Sample_ID", "Longitude", "Latitude", "Cluster", "Basin_cluster", "Year", "Label_Cls"}
+pa_required = {"Sample_ID", "Longitude", "Latitude", "Year"} if "Sample_ID" in pa_df.columns else {"PA_ID", "Longitude", "Latitude", "Year"}
 
 positive_missing = positive_required.difference(positive_df.columns)
 pa_missing = pa_required.difference(pa_df.columns)
@@ -46,16 +54,16 @@ if pa_missing:
     raise KeyError(f"Missing columns in {PA_PATH.name}: {sorted(pa_missing)}")
 
 positive_binary = (
-    positive_df.loc[positive_df["Label_Cls"].eq(POSITIVE_LABEL), ["RTS_ID", "Longitude", "Latitude", "Year", "Cluster", "Basin_cluster"]]
+    positive_df.loc[positive_df["Label_Cls"].eq(POSITIVE_LABEL), ["Sample_ID", "Longitude", "Latitude", "Year", "Cluster", "Basin_cluster"]]
     .copy()
-    .rename(columns={"RTS_ID": "Sample_ID"})
 )
 positive_binary["Label"] = POSITIVE_LABEL
 positive_binary["Year"] = pd.to_numeric(positive_binary["Year"], errors="raise").astype(int)
 positive_binary["Cluster"] = pd.to_numeric(positive_binary["Cluster"], errors="raise").astype("Int64")
 positive_binary["Basin_cluster"] = pd.to_numeric(positive_binary["Basin_cluster"], errors="raise").astype("Int64")
 
-pa_binary = pa_df.loc[:, ["PA_ID", "Longitude", "Latitude", "Year"]].copy().rename(columns={"PA_ID": "Sample_ID"})
+pa_id_col = "Sample_ID" if "Sample_ID" in pa_df.columns else "PA_ID"
+pa_binary = pa_df.loc[:, [pa_id_col, "Longitude", "Latitude", "Year"]].copy().rename(columns={pa_id_col: "Sample_ID"})
 pa_binary["Year"] = pd.to_numeric(pa_binary["Year"], errors="raise").astype(int)
 pa_binary["Label"] = NEGATIVE_LABEL
 pa_binary["Cluster"] = 0

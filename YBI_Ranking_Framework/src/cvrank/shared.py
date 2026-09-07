@@ -334,6 +334,7 @@ def prepare_loaders(
     cluster_col: str | None,
     year_col: str,
     split: PreparedSplit,
+    scaler: StandardScaler | None = None,
 ) -> tuple[DataLoader, DataLoader, StandardScaler, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any] | None]:
     y_cls = df[label_col].fillna(-1).to_numpy(dtype=float)
     y_rank = df[rank_col].fillna(0).to_numpy(dtype=float) if rank_col is not None else np.zeros(len(df), dtype=float)
@@ -385,9 +386,12 @@ def prepare_loaders(
 
     x = working_df[feature_cols].to_numpy(dtype=float)
     x_train, x_eval = x[train_idx], x[eval_idx]
-    scaler = StandardScaler()
-    x_train_scaled = scaler.fit_transform(x_train)
-    x_eval_scaled = scaler.transform(x_eval)
+    active_scaler = scaler if scaler is not None else StandardScaler()
+    if scaler is None:
+        x_train_scaled = active_scaler.fit_transform(x_train)
+    else:
+        x_train_scaled = active_scaler.transform(x_train)
+    x_eval_scaled = active_scaler.transform(x_eval)
 
     train_ds = RTSTabularDataset(x_train_scaled, y_cls[train_idx], y_rank[train_idx], years[train_idx], clusters[train_idx])
     eval_ds = RTSTabularDataset(x_eval_scaled, y_cls[eval_idx], y_rank[eval_idx], years[eval_idx], clusters[eval_idx])
@@ -400,7 +404,7 @@ def prepare_loaders(
     drop_last = len(train_ds) > effective_batch_size and (len(train_ds) % effective_batch_size == 1)
     train_loader = DataLoader(train_ds, batch_size=effective_batch_size, shuffle=True, drop_last=drop_last)
     eval_loader = DataLoader(eval_ds, batch_size=max(1, min(effective_batch_size, len(eval_ds))), shuffle=False)
-    return train_loader, eval_loader, scaler, y_cls, y_rank, years, clusters, x, fitted_feature_preparation
+    return train_loader, eval_loader, active_scaler, y_cls, y_rank, years, clusters, x, fitted_feature_preparation
 
 
 def has_split_manifest(config: dict[str, Any]) -> bool:

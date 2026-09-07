@@ -64,5 +64,10 @@ table/
 # !table/**/*.xlsx
 # !table/**/*.pdf
 
-
+Susceptibility_Mapping/cache/
 GRL/
+Susceptibility_Mapping/output/
+YBI_Ranking_Framework/artifacts/runs/
+YBI_Ranking_Framework/data/output/
+Dataset_Construction/inputs/QTP_SlopeUnits.gpkg
+Dataset_Construction/inputs/QTP_SlopeUnits_full_raw.gpkg

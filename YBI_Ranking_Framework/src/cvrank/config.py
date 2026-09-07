@@ -12,7 +12,27 @@ WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
-from .constants import DEFAULT_BATCH_SIZE, DEFAULT_N_SPLITS, DEFAULT_SEED, FEATURE_COLS
+from .constants import (
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_N_SPLITS,
+    DEFAULT_SEED,
+    DEFAULT_SPATIAL_BLOCK_ORIGIN_X_M,
+    DEFAULT_SPATIAL_BLOCK_ORIGIN_Y_M,
+    DEFAULT_SPATIAL_MAX_FOLD_SIZE_IMBALANCE,
+    DEFAULT_SPATIAL_MIN_BLOCKS_PER_FOLD,
+    DEFAULT_SPATIAL_SOURCE_CRS,
+    DEFAULT_SPATIAL_TARGET_CRS,
+    DEFAULT_SPATIAL_VARIOGRAM_MAX_PAIRS,
+    DEFAULT_SPATIAL_VARIOGRAM_MIN_PAIRS_PER_LAG,
+    DEFAULT_SPATIAL_VARIOGRAM_N_LAGS,
+    DEFAULT_SPATIAL_VARIOGRAM_SAMPLE_SIZE,
+    DEFAULT_SPATIAL_X_COL,
+    DEFAULT_SPATIAL_Y_COL,
+    DEFAULT_SPLIT_STRATEGY,
+    FEATURE_COLS,
+    SPLIT_STRATEGY_SPATIAL_BLOCK_CV,
+    SUPPORTED_SPLIT_STRATEGIES,
+)
 from .constants import RANK_LOSS_MODE_NDCG_AWARE_LAMBDARANK
 
 def _project_output_root(project_root: str | Path) -> Path:
@@ -126,6 +146,46 @@ def validate_config_schema(config: dict[str, Any]) -> None:
     if config.get("n_splits") is not None and int(config["n_splits"]) < 2:
         raise ValueError("`n_splits` must be >= 2")
 
+    split_strategy = str(config.get("split_strategy", DEFAULT_SPLIT_STRATEGY)).strip().lower()
+    split_strategy = {
+        "stratified_group": "stratified_group_kfold",
+        "spatial": SPLIT_STRATEGY_SPATIAL_BLOCK_CV,
+        "spatial_block": SPLIT_STRATEGY_SPATIAL_BLOCK_CV,
+    }.get(split_strategy, split_strategy)
+    if split_strategy not in SUPPORTED_SPLIT_STRATEGIES:
+        raise ValueError(
+            f"Unsupported split_strategy `{split_strategy}`. Expected one of: {sorted(SUPPORTED_SPLIT_STRATEGIES)}"
+        )
+    if split_strategy == SPLIT_STRATEGY_SPATIAL_BLOCK_CV:
+        for key, default in (
+            ("spatial_x_col", DEFAULT_SPATIAL_X_COL),
+            ("spatial_y_col", DEFAULT_SPATIAL_Y_COL),
+            ("spatial_source_crs", DEFAULT_SPATIAL_SOURCE_CRS),
+            ("spatial_target_crs", DEFAULT_SPATIAL_TARGET_CRS),
+        ):
+            if config.get(key, default) in (None, ""):
+                raise ValueError(f"`{key}` must be provided for spatial_block_cv.")
+        minimum_integer_keys = {
+            "spatial_variogram_n_lags": (DEFAULT_SPATIAL_VARIOGRAM_N_LAGS, 3),
+            "spatial_variogram_max_pairs": (DEFAULT_SPATIAL_VARIOGRAM_MAX_PAIRS, 3),
+            "spatial_variogram_min_pairs_per_lag": (DEFAULT_SPATIAL_VARIOGRAM_MIN_PAIRS_PER_LAG, 1),
+            "spatial_variogram_sample_size": (DEFAULT_SPATIAL_VARIOGRAM_SAMPLE_SIZE, 4),
+        }
+        for key, (default, minimum) in minimum_integer_keys.items():
+            if int(config.get(key, default)) < minimum:
+                raise ValueError(f"`{key}` must be >= {minimum} for spatial_block_cv.")
+        block_size = config.get("spatial_block_size_m")
+        if block_size not in (None, "") and float(block_size) <= 0:
+            raise ValueError("`spatial_block_size_m` must be > 0 when provided.")
+        min_blocks_per_fold = int(config.get("spatial_min_blocks_per_fold", DEFAULT_SPATIAL_MIN_BLOCKS_PER_FOLD))
+        if min_blocks_per_fold < 1:
+            raise ValueError("`spatial_min_blocks_per_fold` must be >= 1.")
+        max_fold_imbalance = float(
+            config.get("spatial_max_fold_size_imbalance", DEFAULT_SPATIAL_MAX_FOLD_SIZE_IMBALANCE)
+        )
+        if max_fold_imbalance < 0:
+            raise ValueError("`spatial_max_fold_size_imbalance` must be >= 0.")
+
 
 def load_yaml_config(path: str | Path) -> dict[str, Any]:
     config_path = Path(path).resolve()
@@ -206,7 +266,20 @@ def build_common_defaults(base_dir: str | Path | None = None) -> dict[str, Any]:
         "n_splits": DEFAULT_N_SPLITS,
         "group_col": "Sample_ID",
         "stratify_mode": "year_plus_label",
-        "split_strategy": "stratified_group_kfold",
+        "split_strategy": DEFAULT_SPLIT_STRATEGY,
+        "spatial_x_col": DEFAULT_SPATIAL_X_COL,
+        "spatial_y_col": DEFAULT_SPATIAL_Y_COL,
+        "spatial_source_crs": DEFAULT_SPATIAL_SOURCE_CRS,
+        "spatial_target_crs": DEFAULT_SPATIAL_TARGET_CRS,
+        "spatial_block_size_m": None,
+        "spatial_variogram_n_lags": DEFAULT_SPATIAL_VARIOGRAM_N_LAGS,
+        "spatial_variogram_max_pairs": DEFAULT_SPATIAL_VARIOGRAM_MAX_PAIRS,
+        "spatial_variogram_min_pairs_per_lag": DEFAULT_SPATIAL_VARIOGRAM_MIN_PAIRS_PER_LAG,
+        "spatial_variogram_sample_size": DEFAULT_SPATIAL_VARIOGRAM_SAMPLE_SIZE,
+        "spatial_block_origin_x_m": DEFAULT_SPATIAL_BLOCK_ORIGIN_X_M,
+        "spatial_block_origin_y_m": DEFAULT_SPATIAL_BLOCK_ORIGIN_Y_M,
+        "spatial_min_blocks_per_fold": DEFAULT_SPATIAL_MIN_BLOCKS_PER_FOLD,
+        "spatial_max_fold_size_imbalance": DEFAULT_SPATIAL_MAX_FOLD_SIZE_IMBALANCE,
     }
 
 
@@ -319,6 +392,20 @@ def _build_train_validate_config(route: str, base_dir: str | Path | None = None,
         "rank_col": route_def.rank_col,
         "cluster_col": route_def.cluster_col,
         "stratify_mode": "year_plus_label",
+        "split_strategy": DEFAULT_SPLIT_STRATEGY,
+        "spatial_x_col": DEFAULT_SPATIAL_X_COL,
+        "spatial_y_col": DEFAULT_SPATIAL_Y_COL,
+        "spatial_source_crs": DEFAULT_SPATIAL_SOURCE_CRS,
+        "spatial_target_crs": DEFAULT_SPATIAL_TARGET_CRS,
+        "spatial_block_size_m": None,
+        "spatial_variogram_n_lags": DEFAULT_SPATIAL_VARIOGRAM_N_LAGS,
+        "spatial_variogram_max_pairs": DEFAULT_SPATIAL_VARIOGRAM_MAX_PAIRS,
+        "spatial_variogram_min_pairs_per_lag": DEFAULT_SPATIAL_VARIOGRAM_MIN_PAIRS_PER_LAG,
+        "spatial_variogram_sample_size": DEFAULT_SPATIAL_VARIOGRAM_SAMPLE_SIZE,
+        "spatial_block_origin_x_m": DEFAULT_SPATIAL_BLOCK_ORIGIN_X_M,
+        "spatial_block_origin_y_m": DEFAULT_SPATIAL_BLOCK_ORIGIN_Y_M,
+        "spatial_min_blocks_per_fold": DEFAULT_SPATIAL_MIN_BLOCKS_PER_FOLD,
+        "spatial_max_fold_size_imbalance": DEFAULT_SPATIAL_MAX_FOLD_SIZE_IMBALANCE,
         "use_rank_aux": route_def.use_rank_aux,
         "use_cluster_in_rank_loss": route_def.use_cluster_in_rank_loss,
         "hidden_dims": [128, 64, 32],

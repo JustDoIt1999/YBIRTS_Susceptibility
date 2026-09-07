@@ -36,7 +36,10 @@ STEPS: tuple[WorkflowStep, ...] = (
         name="pa_sampling",
         notebook=DATA_PROCESSING_DIR / "Jupyter_notebook" / "01_pa_sampling" / "pa_sampling.ipynb",
         module="dataset_construction.pa_sampling",
-        outputs=(DATA_PROCESSING_DIR / "outputs" / "01_pa_sampling" / "pseudo_absence_random.csv",),
+        outputs=(
+            DATA_PROCESSING_DIR / "outputs" / "01_pa_sampling" / "positive_su.csv",
+            DATA_PROCESSING_DIR / "outputs" / "01_pa_sampling" / "pseudo_absence_random.csv",
+        ),
     ),
     WorkflowStep(
         number=2,

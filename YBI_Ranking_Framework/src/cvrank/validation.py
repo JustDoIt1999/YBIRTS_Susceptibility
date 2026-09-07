@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import pickle
 from pathlib import Path
 from typing import Any
 
@@ -207,6 +208,24 @@ def _load_optional_feature_preparation_artifact(path_value: str | Path | None) -
     return load_feature_preparation_artifact(artifact_path), artifact_path
 
 
+def _load_scaler_artifact(path_value: str | Path | None, *, required: bool = False) -> tuple[Any | None, Path | None]:
+    if not isinstance(path_value, (str, Path)) or not str(path_value).strip():
+        if required:
+            raise ValueError("A saved scaler artifact is required for multi-fold OOF validation.")
+        return None, None
+    scaler_path = Path(path_value).resolve()
+    if not scaler_path.exists():
+        raise FileNotFoundError(f"Scaler artifact not found: {scaler_path}")
+    try:
+        with scaler_path.open("rb") as fh:
+            scaler = pickle.load(fh)
+    except (OSError, pickle.PickleError, EOFError) as exc:
+        raise ValueError(f"Unable to load scaler artifact: {scaler_path}") from exc
+    if not hasattr(scaler, "transform"):
+        raise ValueError(f"Scaler artifact does not provide transform(): {scaler_path}")
+    return scaler, scaler_path
+
+
 def run_validation(config: dict[str, Any]) -> dict[str, Any]:
     from .data_utils import seed_everything
 
@@ -226,6 +245,8 @@ def run_validation(config: dict[str, Any]) -> dict[str, Any]:
         base_feature_preparation, base_feature_preparation_path = _load_optional_feature_preparation_artifact(
             fold_entries[int(requested_folds[0])].get("feature_preparation_path")
         )
+        if base_feature_preparation is None or base_feature_preparation_path is None:
+            raise ValueError("Multi-fold OOF validation requires a feature preparation artifact for every fold.")
     else:
         resolved_feature_preparation_path = config.get("feature_preparation_path")
         if resolved_feature_preparation_path is None and _default_feature_preparation_path(config).exists():
@@ -265,13 +286,14 @@ def run_validation(config: dict[str, Any]) -> dict[str, Any]:
             fold_artifact, fold_artifact_path = _load_optional_feature_preparation_artifact(
                 fold_entries[int(fold_index)].get("feature_preparation_path")
             )
-            if fold_artifact is not None:
-                fold_feature_cols = list(fold_artifact.get("final_feature_cols", feature_cols))
-                if fold_feature_cols != feature_cols:
-                    raise ValueError(
-                        f"Fold {fold_index} feature schema does not match prepared validation frame: "
-                        f"{fold_feature_cols} != {feature_cols}"
-                    )
+            if fold_artifact is None or fold_artifact_path is None:
+                raise ValueError(f"Fold {fold_index} is missing its feature preparation artifact.")
+            fold_feature_cols = list(fold_artifact.get("final_feature_cols", feature_cols))
+            if fold_feature_cols != feature_cols:
+                raise ValueError(
+                    f"Fold {fold_index} feature schema does not match prepared validation frame: "
+                    f"{fold_feature_cols} != {feature_cols}"
+                )
             fold_config = dict(config)
             fold_config["fold_index"] = int(fold_index)
             if fold_artifact is not None:
@@ -291,6 +313,18 @@ def run_validation(config: dict[str, Any]) -> dict[str, Any]:
                 )
             if not current_df.index.equals(df.index):
                 raise ValueError(f"Fold {fold_index} prepared validation rows do not align with base frame.")
+
+            model_raw = fold_entries[fold_index].get("model_path")
+            if not isinstance(model_raw, (str, Path)) or not str(model_raw).strip():
+                raise ValueError(f"Fold {fold_index} manifest does not provide a model_path.")
+            model_path = Path(model_raw).resolve()
+            if not model_path.exists():
+                raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
+            fold_scaler, scaler_path = _load_scaler_artifact(
+                fold_entries[fold_index].get("scaler_path"),
+                required=True,
+            )
+
             _, eval_loader, _, _, _, _, _, _, _ = prepare_loaders(
                 df,
                 fold_config,
@@ -300,12 +334,8 @@ def run_validation(config: dict[str, Any]) -> dict[str, Any]:
                 cluster_col,
                 year_col,
                 split,
+                scaler=fold_scaler,
             )
-
-            model_path = Path(fold_entries[fold_index]["model_path"]).resolve()
-            scaler_path = Path(fold_entries[fold_index]["scaler_path"]).resolve()
-            if not model_path.exists():
-                raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
 
             model = build_model(input_dim=len(feature_cols), config=fold_config).to(device)
             model.load_state_dict(torch.load(model_path, map_location=device))
@@ -353,6 +383,22 @@ def run_validation(config: dict[str, Any]) -> dict[str, Any]:
             oof_detail_frames.append(detail_frame)
 
         oof_details = pd.concat(oof_detail_frames, ignore_index=True)
+        expected_row_indices = pd.Index(np.asarray(df.index, dtype=int))
+        observed_row_indices = pd.Index(oof_details["row_index"].to_numpy(dtype=int))
+        if (
+            not expected_row_indices.is_unique
+            or not observed_row_indices.is_unique
+            or len(observed_row_indices) != len(expected_row_indices)
+            or set(observed_row_indices.tolist()) != set(expected_row_indices.tolist())
+        ):
+            raise ValueError(
+                "OOF coverage must contain every cleaned modeling row exactly once; "
+                f"expected={len(expected_row_indices)}, observed={len(observed_row_indices)}."
+            )
+        if group_col in oof_details.columns:
+            fold_counts_by_group = oof_details.groupby(group_col, dropna=False)["fold_index"].nunique()
+            if not fold_counts_by_group.empty and int(fold_counts_by_group.max()) > 1:
+                raise ValueError("OOF coverage assigns at least one group to multiple validation folds.")
         oof_details["pred_label"] = (oof_details["y_prob"].to_numpy(dtype=float) >= threshold).astype(int)
         oof_details["is_error"] = (
             oof_details["pred_label"].to_numpy(dtype=int) != oof_details["y_true"].to_numpy(dtype=int)
@@ -362,6 +408,22 @@ def run_validation(config: dict[str, Any]) -> dict[str, Any]:
         )
         oof_details_path = validation_metrics_path.with_name(validation_metrics_path.stem + "_oof.csv")
         oof_details.to_csv(oof_details_path, index=False)
+        oof_metrics = compute_metrics_from_outputs(
+            {
+                "y_prob": oof_details["y_prob"].to_numpy(dtype=float),
+                "y_true": oof_details["y_true"].to_numpy(dtype=float),
+                "y_rank": oof_details["y_rank"].to_numpy(dtype=float),
+                "years": oof_details[year_col].to_numpy(dtype=float),
+                "clusters": (
+                    oof_details[cluster_col].to_numpy(dtype=float)
+                    if cluster_col is not None and cluster_col in oof_details.columns
+                    else np.zeros(len(oof_details), dtype=float)
+                ),
+            },
+            threshold=threshold,
+            include_rank_metrics=rank_aux_effective,
+            use_cluster_in_rank_loss=use_cluster_in_rank_loss,
+        )
         payload = {
             "route": route,
             "split_mode": "fold_manifest_oof",
@@ -379,6 +441,9 @@ def run_validation(config: dict[str, Any]) -> dict[str, Any]:
             "feature_count": len(feature_cols),
             "fold_metrics": fold_metrics,
             "fold_metric_summary": summarize_metric_dicts([item["metrics"] for item in fold_metrics]),
+            "oof_metrics": oof_metrics,
+            "oof_row_count": int(len(oof_details)),
+            "artifact_source": fold_manifest.get("artifact_source"),
             "fold_runs_manifest_path": str(_default_fold_runs_manifest_path(config)),
             "oof_details_path": str(oof_details_path),
             "feature_preparation_path": str(base_feature_preparation_path) if base_feature_preparation_path is not None else None,
@@ -400,6 +465,7 @@ def run_validation(config: dict[str, Any]) -> dict[str, Any]:
                     "Configured feature preparation artifact does not match prepared validation frame: "
                     f"{expected_feature_cols} != {feature_cols}"
                 )
+        saved_scaler, saved_scaler_path = _load_scaler_artifact(single_config.get("scaler_path"))
         _, eval_loader, _, _, _, _, _, _, _ = prepare_loaders(
             df,
             single_config,
@@ -409,6 +475,7 @@ def run_validation(config: dict[str, Any]) -> dict[str, Any]:
             cluster_col,
             year_col,
             split,
+            scaler=saved_scaler,
         )
 
         model_path = Path(single_config["model_path"]).resolve()

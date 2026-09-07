@@ -654,7 +654,7 @@ def run_lambda_selection(config: dict[str, Any]) -> dict[str, Any]:
         "summary_csv": str(summary_csv),
         "route_config_paths": [str(resolve_path(path, base_dir=base_dir) or path) for path in route_config_paths],
         "selected_config_paths": config_paths,
-        "train_after_select": bool(config.get("train_after_select", False)),
+        "post_selection_action": str(config.get("post_selection_action", "selection_only")),
         SELECTION_POLICY_KEY: (
             selected_rows[0][SELECTION_POLICY_KEY]
             if selected_rows and len({row[SELECTION_POLICY_KEY] for row in selected_rows}) == 1
