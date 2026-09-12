@@ -52,22 +52,18 @@ STATIC_CACHE_COLS = [
     "Slope",
     "Slope_std",  # source Slope pixels; SU-level stdDev is computed below
     "Northness",
-    "Eastness",
     "TWI",
-    "Local_Relief",
     "Soil",
     "Vegetation_type",
     "GIC",
 ]
-STATIC_MEAN_COLS = ["Slope", "Northness", "Eastness", "TWI", "Local_Relief", "Soil", "GIC"]
+STATIC_MEAN_COLS = ["Slope", "Northness", "TWI", "Soil", "GIC"]
 DYNAMIC_COLS = [
     "TDD",
     "SMDP",
     "Precipitation",
-    "WSTmax",
-    "WSRH",
-    "NDVI",
     "Summer_SoilMoisture",
+    "NDVI",
 ]
 MAX_VEGETATION_CLASS = 32
 METADATA_CHUNK_SIZE = 50_000

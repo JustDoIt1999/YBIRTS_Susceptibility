@@ -194,8 +194,9 @@ def iter_aligned_feature_batches(
 
     static_pf = pq.ParquetFile(static_path)
     dynamic_pf = pq.ParquetFile(dynamic_path)
-    required_static = ["fid", "su_id", "stats_status", *feature_cols[:9]]
-    required_dynamic = ["fid", "stats_status", *feature_cols[9:]]
+    static_count = len(ee_ctx.CURRENT_STATIC_EXPORT_FEATURE_COLS)
+    required_static = ["fid", "su_id", "stats_status", *feature_cols[:static_count]]
+    required_dynamic = ["fid", "stats_status", *feature_cols[static_count:]]
     static_names = set(static_pf.schema_arrow.names)
     dynamic_names = set(dynamic_pf.schema_arrow.names)
     missing_static = sorted(set(required_static) - static_names)
@@ -274,8 +275,9 @@ def predict_su_batch(
     uncertainty_metrics: tuple[str, ...],
 ) -> dict[str, Any]:
     engine.import_runtime_dependencies()
-    static_cols = bundle.feature_cols[:9]
-    dynamic_cols = bundle.feature_cols[9:]
+    static_count = len(ee_ctx.CURRENT_STATIC_EXPORT_FEATURE_COLS)
+    static_cols = bundle.feature_cols[:static_count]
+    dynamic_cols = bundle.feature_cols[static_count:]
     static_frame = batch_to_frame(static_batch, static_cols, path=static_path)
     dynamic_frame = batch_to_frame(dynamic_batch, dynamic_cols, path=dynamic_path)
     features = engine.pd.concat([static_frame, dynamic_frame], axis=1).loc[:, bundle.feature_cols]

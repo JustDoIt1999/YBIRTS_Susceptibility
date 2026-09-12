@@ -112,11 +112,13 @@ def resolve_cvrank_python() -> str:
     python_bin = os.environ.get("PYTHON_BIN", "").strip()
     if python_bin:
         return python_bin
+    if sys.executable and Path(sys.executable).exists():
+        return sys.executable
     conda_prefix = os.environ.get("CONDA_PREFIX", "").strip()
     if conda_prefix:
-        candidate = Path(conda_prefix) / "bin" / "python"
-        if candidate.exists() and os.access(candidate, os.X_OK):
-            return str(candidate)
+        for candidate in (Path(conda_prefix) / "bin" / "python", Path(conda_prefix) / "python.exe"):
+            if candidate.exists():
+                return str(candidate)
     resolved = shutil.which("python")
     if resolved:
         return resolved

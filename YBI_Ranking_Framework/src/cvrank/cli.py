@@ -797,9 +797,9 @@ def _run_with_metadata(base_dir: Path, command: str, payload: dict[str, Any], fn
         save_run_metadata(base_dir, command, meta)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     base_dir = Path.cwd().resolve()
 
     if args.command in NON_RUNTIME_COMMANDS:
