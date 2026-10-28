@@ -73,8 +73,6 @@ def compute_quantile_thresholds(sample: np.ndarray, *, class_count: int) -> np.n
     if int(class_count) < 2:
         raise ValueError("class_count must be at least 2.")
     quantiles = np.linspace(0.0, 1.0, int(class_count) + 1, dtype=np.float64)[1:-1]
-    if quantiles.size == 0:
-        return np.asarray([], dtype=np.float32)
     thresholds = np.quantile(finite, quantiles)
     return np.asarray(thresholds, dtype=np.float32)
 
@@ -111,24 +109,21 @@ def compute_jenks_thresholds(sample: np.ndarray, *, class_count: int) -> np.ndar
     variance[0, 1:] = 0.0
 
     for end in range(1, n + 1):
-        s1 = 0.0
-        s2 = 0.0
-        w = 0
-        for span in range(1, end + 1):
-            idx = end - span + 1
-            value = finite[idx - 1]
-            w += 1
-            s1 += value
-            s2 += value * value
-            var = s2 - (s1 * s1) / w
-            if idx != 1:
-                for cls in range(2, class_count + 1):
-                    candidate = var + variance[idx - 1, cls - 1]
-                    if candidate < variance[end, cls]:
-                        lower[end, cls] = idx
-                        variance[end, cls] = candidate
+        # Accumulate in the same reverse order as the scalar recurrence.
+        values = finite[:end][::-1]
+        sums = np.cumsum(values)
+        squared_sums = np.cumsum(values * values)
+        segment_variances = squared_sums - sums * sums / np.arange(1, end + 1)
+        if end > 1:
+            candidates = segment_variances[:-1, None] + variance[end - 1:0:-1, 1:class_count]
+            best_spans = np.argmin(candidates, axis=0)
+            best_variances = candidates[best_spans, np.arange(class_count - 1)]
+            improved = best_variances < variance[end, 2:]
+            # argmin chooses the shortest span on ties, matching the scalar recurrence's strict '<'.
+            lower[end, 2:][improved] = end - best_spans[improved]
+            variance[end, 2:][improved] = best_variances[improved]
         lower[end, 1] = 1
-        variance[end, 1] = var if end > 0 else 0.0
+        variance[end, 1] = segment_variances[-1]
 
     thresholds = np.zeros(class_count - 1, dtype=np.float64)
     end = n

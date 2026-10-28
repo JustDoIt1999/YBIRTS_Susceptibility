@@ -65,10 +65,6 @@ TilePreparationFuture = Future[TilePreparationResult]
 MODEL_BACKEND_CVRANK = "cvrank"
 DEFAULT_MODEL_BACKEND = MODEL_BACKEND_CVRANK
 SUPPORTED_MODEL_BACKENDS = {MODEL_BACKEND_CVRANK}
-_MODEL_BACKEND_ALIASES = {
-    MODEL_BACKEND_CVRANK: MODEL_BACKEND_CVRANK,
-}
-_MODEL_BACKEND_CACHE: dict[str, dict[str, Any]] = {}
 
 RANK_ROUTES = {"dbscan", "no_cluster", "basin"}
 IN_MEMORY_NODATA_VALUE = -9999.0
@@ -85,10 +81,6 @@ DEFAULT_UNCERTAINTY_OUTPUT_SUBDIR = "uncertainty"
 UNCERTAINTY_BACKFILL_PROGRESS_SUFFIX = "_uncertainty_backfill_progress.json"
 UNCERTAINTY_BACKFILL_FAILED_SUFFIX = "_uncertainty_backfill_failed_tiles.json"
 UNCERTAINTY_BACKFILL_RUNTIME_SUFFIX = "_uncertainty_backfill_runtime_summary.json"
-
-
-def _project_output_root(project_root: str | Path) -> Path:
-    return Path(project_root).resolve() / "data" / "output"
 
 
 def utc_now_iso() -> str:
@@ -141,116 +133,31 @@ def import_runtime_dependencies() -> None:
 
 
 def normalize_model_backend(value: Any | None) -> str:
-    normalized = _MODEL_BACKEND_ALIASES.get(str(value or DEFAULT_MODEL_BACKEND).strip().lower())
-    if normalized is None:
+    normalized = str(value or DEFAULT_MODEL_BACKEND).strip().lower()
+    if normalized not in SUPPORTED_MODEL_BACKENDS:
         raise ValueError(
             f"Unsupported model_backend: {value!r}; supported={sorted(SUPPORTED_MODEL_BACKENDS)}"
         )
     return normalized
 
 
-def load_model_backend_adapter(model_backend: Any | None) -> dict[str, Any]:
-    normalized_backend = normalize_model_backend(model_backend)
-    cached = _MODEL_BACKEND_CACHE.get(normalized_backend)
-    if cached is not None:
-        return cached
-
-    try:
-        from cvrank.config import load_yaml_config as _load_yaml_config
-        from cvrank.config import resolve_config_paths as _resolve_config_paths
-        from cvrank.data_utils import apply_feature_preparation_artifact as _apply_feature_preparation_artifact
-        from cvrank.data_utils import load_feature_preparation_artifact as _load_feature_preparation_artifact
-        from cvrank.shared import build_model as _build_model
-        from cvrank.shared import default_feature_preparation_path as _default_feature_preparation_path
-        from cvrank.shared import get_device_metadata as _get_device_metadata
-        from cvrank.shared import resolve_torch_device as _resolve_torch_device
-    except ImportError as exc:
-        raise ImportError("Missing cvrank inference dependencies, unable to load susceptibility mapping backend.") from exc
-
-    def _load_training_checkpoint(path: str | Path, device: Any) -> dict[str, Any]:
-        assert torch is not None
-        return {
-            "checkpoint_format": "legacy_state_dict_only",
-            "model_state_dict": torch.load(Path(path), map_location=device),
-        }
-
-    adapter = {
-        "model_backend": normalized_backend,
-        "load_yaml_config": _load_yaml_config,
-        "resolve_config_paths": _resolve_config_paths,
-        "build_model": _build_model,
-        "load_training_checkpoint": _load_training_checkpoint,
-        "load_feature_preparation_artifact": _load_feature_preparation_artifact,
-        "apply_feature_preparation_artifact": _apply_feature_preparation_artifact,
-        "default_feature_preparation_path": _default_feature_preparation_path,
-        "get_device_metadata": _get_device_metadata,
-        "resolve_torch_device": _resolve_torch_device,
-    }
-
-    _MODEL_BACKEND_CACHE[normalized_backend] = adapter
-    return adapter
-
-
-def load_model_backend_config_loader(model_backend: Any | None) -> tuple[Any, Any]:
-    normalize_model_backend(model_backend)
-    try:
-        from cvrank.config import load_yaml_config as _load_yaml_config
-        from cvrank.config import resolve_config_paths as _resolve_config_paths
-    except ImportError as exc:
-        raise ImportError("Missing cvrank.config dependency, unable to parse training configuration.") from exc
-    return _load_yaml_config, _resolve_config_paths
-
-
 def load_training_config(
     config_path: str | Path,
     model_backend: Any | None,
 ) -> dict[str, Any]:
-    load_yaml_config_fn, resolve_config_paths_fn = load_model_backend_config_loader(model_backend)
-    raw_config = load_yaml_config_fn(config_path)
-    resolved_config = resolve_config_paths_fn(raw_config)
-    resolved_config["_config_path"] = str(_as_path(config_path))
+    from cvrank.config import load_yaml_config, resolve_config_paths
+
+    model_backend = normalize_model_backend(model_backend)
+    resolved_config = resolve_config_paths(load_yaml_config(config_path))
+    resolved_config["_config_path"] = str(resolve_path(config_path))
     resolved_config["_resolved_base_dir"] = str(Path(resolved_config.get("base_dir") or Path(config_path).parent).resolve())
-    resolved_config["model_backend"] = normalize_model_backend(model_backend)
+    resolved_config["model_backend"] = model_backend
     return resolved_config
-
-
-def normalize_explicit_train_config_path(config_path: str | Path, model_backend: Any | None) -> Path:
-    return _as_path(config_path)
-
-
-def ensure_inference_dependencies(model_backend: Any | None) -> dict[str, Any]:
-    import_runtime_dependencies()
-    missing: list[str] = []
-    if torch is None:
-        missing.append("torch")
-    adapter = load_model_backend_adapter(model_backend)
-    for key in (
-        "build_model",
-        "load_training_checkpoint",
-        "load_feature_preparation_artifact",
-        "apply_feature_preparation_artifact",
-        "default_feature_preparation_path",
-        "get_device_metadata",
-        "resolve_torch_device",
-    ):
-        if adapter.get(key) is None:
-            missing.append(f"{normalize_model_backend(model_backend)}:{key}")
-    if missing:
-        raise ImportError(
-            "Missing dependencies for inference mode; unable to load the model or execute predictions."
-            f" missing={sorted(set(missing))}"
-        )
-    return adapter
 
 
 def resolve_path(value: str | Path) -> Path:
     """Return an absolute, user-expanded path for public callers."""
     return Path(value).expanduser().resolve()
-
-
-def _as_path(value: str | Path) -> Path:
-    """Backward-compatible internal alias for :func:`resolve_path`."""
-    return resolve_path(value)
 
 
 def _resolve_path_from_base(value: str | Path, base_dir: str | Path) -> Path:
@@ -269,7 +176,7 @@ def compute_payload_hash(payload: Any) -> str:
 
 
 def compute_file_hash(path: str | Path) -> str:
-    resolved_path = _as_path(path)
+    resolved_path = resolve_path(path)
     hasher = sha256()
     with resolved_path.open("rb") as fh:
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
@@ -278,7 +185,7 @@ def compute_file_hash(path: str | Path) -> str:
 
 
 def describe_model_artifact(path: str | Path) -> dict[str, Any]:
-    resolved_path = _as_path(path)
+    resolved_path = resolve_path(path)
     if not resolved_path.is_file():
         raise FileNotFoundError(f"Required model artifact not found: {resolved_path}")
     stat = resolved_path.stat()
@@ -404,7 +311,7 @@ class TerminalProgressDisplay:
 
 
 def save_json(path: str | Path, payload: Any) -> Path:
-    resolved_path = _as_path(path)
+    resolved_path = resolve_path(path)
     resolved_path.parent.mkdir(parents=True, exist_ok=True)
     with resolved_path.open("w", encoding="utf-8") as fh:
         json.dump(payload, fh, ensure_ascii=False, indent=2, default=str)
@@ -412,14 +319,14 @@ def save_json(path: str | Path, payload: Any) -> Path:
 
 
 def load_json(path: str | Path) -> Any:
-    resolved_path = _as_path(path)
+    resolved_path = resolve_path(path)
     with resolved_path.open("r", encoding="utf-8") as fh:
         return json.load(fh)
 
 
 def load_yaml_document(config_path: str | Path) -> tuple[dict[str, Any], Path]:
     import_yaml_dependency()
-    resolved_path = _as_path(config_path)
+    resolved_path = resolve_path(config_path)
     with resolved_path.open("r", encoding="utf-8") as fh:
         payload = yaml.safe_load(fh) or {}
     if not isinstance(payload, dict):
@@ -475,14 +382,14 @@ def resolve_raster_output_dir(job: dict[str, Any], default_path: str | Path | No
         candidate = job.get("output_dir")
     if candidate in (None, ""):
         candidate = default_path or (PREDICTION_ROOT / "outputs")
-    return _as_path(candidate)
+    return resolve_path(candidate)
 
 
 def resolve_json_output_dir(job: dict[str, Any], default_path: str | Path | None = None) -> Path:
     candidate = job.get("json_output_dir")
     if candidate in (None, ""):
         candidate = default_path or (PREDICTION_ROOT / "outputs")
-    return _as_path(candidate)
+    return resolve_path(candidate)
 
 
 def should_write_uncertainty_outputs(job: dict[str, Any], model_members: list[dict[str, Any]]) -> bool:
@@ -608,10 +515,6 @@ def validate_selected_train_config_identity(
     if not isinstance(config, dict):
         raise ValueError(f"Selected train config must be a YAML mapping: {config_path}")
 
-    actual_route = str(config.get("route") or "").strip().lower()
-    actual_batch_size = normalize_training_batch_size(config.get("batch_size"))
-    actual_rank_loss_mode = normalize_rank_loss_mode(config.get("rank_loss_mode"))
-    actual_suffix = config.get("output_suffix")
     requested_identity = make_selected_model_identity(
         route=route,
         batch_size=batch_size,
@@ -619,10 +522,10 @@ def validate_selected_train_config_identity(
         train_output_suffix=train_output_suffix,
     )
     actual_identity = make_selected_model_identity(
-        route=actual_route,
-        batch_size=actual_batch_size,
-        rank_loss_mode=actual_rank_loss_mode,
-        train_output_suffix=actual_suffix,
+        route=config.get("route"),
+        batch_size=config.get("batch_size"),
+        rank_loss_mode=config.get("rank_loss_mode"),
+        train_output_suffix=config.get("output_suffix"),
     )
     if actual_identity != requested_identity:
         raise ValueError(
@@ -723,10 +626,7 @@ def finalize_train_config(job: dict[str, Any]) -> dict[str, Any]:
         resolved["artifact_identity"] = resolved_train_config["artifact_identity"]
         resolved["selection_policy"] = resolved_train_config.get("selection_policy")
     else:
-        resolved["train_config_path"] = normalize_explicit_train_config_path(
-            resolved["train_config_path"],
-            resolved.get("model_backend"),
-        )
+        resolved["train_config_path"] = resolve_path(resolved["train_config_path"])
         resolved["train_config_source"] = "explicit"
     return resolved
 
@@ -791,22 +691,22 @@ def assert_training_schema_matches_features(cfg: dict[str, Any], feature_cols: l
 
 def _load_optional_feature_preparation_artifact(
     path_value: str | Path | None,
-    *,
-    backend_adapter: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, Path | None]:
     if not isinstance(path_value, (str, Path)) or not str(path_value).strip():
         return None, None
-    artifact_path = _as_path(path_value)
+    artifact_path = resolve_path(path_value)
     if not artifact_path.exists():
         raise FileNotFoundError(f"Feature preparation artifact not found: {artifact_path}")
-    return backend_adapter["load_feature_preparation_artifact"](artifact_path), artifact_path
+    from cvrank.data_utils import load_feature_preparation_artifact
+
+    return load_feature_preparation_artifact(artifact_path), artifact_path
 
 
 def resolve_model_member_artifacts(
     cfg: dict[str, Any],
-    *,
-    backend_adapter: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], Path | None]:
+    from cvrank.shared import default_feature_preparation_path
+
     manifest_path = resolve_cfg_path(cfg, "fold_runs_manifest_path")
     members_meta: list[dict[str, Any]] = []
     if manifest_path is not None and manifest_path.exists():
@@ -815,12 +715,12 @@ def resolve_model_member_artifacts(
             members_meta.append(
                 {
                     "fold_index": item.get("fold_index"),
-                    "model_path": _as_path(item["model_path"]),
-                    "scaler_path": _as_path(item["scaler_path"]),
+                    "model_path": resolve_path(item["model_path"]),
+                    "scaler_path": resolve_path(item["scaler_path"]),
                     "feature_preparation_path": (
                         None
                         if item.get("feature_preparation_path") in (None, "")
-                        else _as_path(item["feature_preparation_path"])
+                        else resolve_path(item["feature_preparation_path"])
                     ),
                 }
             )
@@ -833,7 +733,7 @@ def resolve_model_member_artifacts(
     if model_path is None or scaler_path is None:
         raise ValueError("The selected config must provide model_path and scaler_path.")
     configured_feature_preparation_path = resolve_cfg_path(cfg, "feature_preparation_path")
-    default_artifact_path = _as_path(backend_adapter["default_feature_preparation_path"](cfg))
+    default_artifact_path = resolve_path(default_feature_preparation_path(cfg))
     if configured_feature_preparation_path is not None:
         feature_preparation_path = configured_feature_preparation_path
     elif default_artifact_path.exists():
@@ -910,15 +810,15 @@ def load_model_scaler_members(
     cfg: dict[str, Any],
     feature_cols: list[str],
     device: Any,
-    *,
-    backend_adapter: dict[str, Any],
     members_meta: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     import_runtime_dependencies()
+    import torch
+    from cvrank.shared import build_model
+
     if members_meta is None:
         members_meta, _manifest_path = resolve_model_member_artifacts(
             cfg,
-            backend_adapter=backend_adapter,
         )
 
     members: list[dict[str, Any]] = []
@@ -929,14 +829,12 @@ def load_model_scaler_members(
             raise FileNotFoundError(f"Scaler file not found: {meta['scaler_path']}")
         artifact, artifact_path = _load_optional_feature_preparation_artifact(
             meta.get("feature_preparation_path"),
-            backend_adapter=backend_adapter,
         )
         member_feature_cols = list(artifact.get("final_feature_cols", feature_cols)) if artifact is not None else list(feature_cols)
         with meta["scaler_path"].open("rb") as fh:
             scaler = pickle.load(fh)
-        model = backend_adapter["build_model"](input_dim=len(member_feature_cols), config=cfg).to(device)
-        checkpoint = backend_adapter["load_training_checkpoint"](meta["model_path"], device)
-        model.load_state_dict(checkpoint["model_state_dict"])
+        model = build_model(input_dim=len(member_feature_cols), config=cfg).to(device)
+        model.load_state_dict(torch.load(meta["model_path"], map_location=device))
         model.eval()
         members.append(
             {
@@ -1112,7 +1010,6 @@ def load_or_create_active_tile_lookup_cache(
     serializable["active_cells"] = [list(item) for item in sorted(payload["active_lookup"])]
     serializable.pop("active_lookup", None)
     save_json(cache_path, serializable)
-    payload["active_lookup"] = {(int(row_idx), int(col_idx)) for row_idx, col_idx in serializable["active_cells"]}
     return payload, cache_path
 
 
@@ -1200,23 +1097,22 @@ def predict_probability_block(
     inference_batch_size: int,
     nodata_value: float,
     *,
-    apply_feature_preparation: Any,
     uncertainty_metrics: tuple[str, ...] | list[str] | None = None,
     uncertainty_epsilon: float = 1e-6,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     import_runtime_dependencies()
+    from cvrank.data_utils import apply_feature_preparation_artifact
+
     base_invalid_mask = aoi_mask < 0.5
-    out = np.full(base_invalid_mask.shape, nodata_value, dtype=np.float32)
     metric_names = ("mean", *(tuple(uncertainty_metrics or DEFAULT_UNCERTAINTY_EXPORT_METRICS)))
-    empty_blocks = {
-        metric_name: out.copy()
-        for metric_name in metric_names
-    }
     flat_frame = pd.DataFrame(feature_array.reshape(-1, len(feature_cols)), columns=feature_cols)
     base_invalid_flat_mask = base_invalid_mask.reshape(-1)
 
     if (~base_invalid_flat_mask).sum() == 0:
-        return empty_blocks, {"valid_pixels": 0}
+        return {
+            name: np.full(base_invalid_mask.shape, nodata_value, dtype=np.float32)
+            for name in metric_names
+        }, {"valid_pixels": 0}
 
     member_predictions: list[NDArray[Any]] = []
     valid_flat_mask: NDArray[Any] | None = None
@@ -1233,7 +1129,7 @@ def predict_probability_block(
                     f"{artifact_raw_feature_cols} != {feature_cols}"
                 )
             transformed, final_feature_cols, invalid_numeric_mask, missing_raw_na_mask, missing_input_nodata_mask = (
-                apply_feature_preparation(
+                apply_feature_preparation_artifact(
                     flat_frame,
                     feature_cols,
                     tuple(float(value) for value in artifact.get("input_nodata_values", [])),
@@ -1273,7 +1169,7 @@ def predict_probability_block(
         fold_predictions: list[NDArray[Any]] = []
         for start in range(0, valid_count, batch_size):
             stop = min(start + batch_size, valid_count)
-            batch_tensor = torch.tensor(x_scaled[start:stop], dtype=torch.float32, device=device)
+            batch_tensor = torch.as_tensor(x_scaled[start:stop], dtype=torch.float32, device=device)
             with torch.inference_mode():
                 _, prob_tensor = member["model"](batch_tensor)
             fold_predictions.append(prob_tensor.detach().cpu().numpy().reshape(-1))
@@ -1285,7 +1181,10 @@ def predict_probability_block(
 
     valid_count = int(valid_flat_mask.sum())
     if not member_predictions or valid_count == 0:
-        return empty_blocks, {"valid_pixels": 0}
+        return {
+            name: np.full(base_invalid_mask.shape, nodata_value, dtype=np.float32)
+            for name in metric_names
+        }, {"valid_pixels": 0}
 
     summary = summarize_member_prediction_matrix(
         np.vstack(member_predictions),
@@ -1331,7 +1230,7 @@ def normalize_runtime_job(job: dict[str, Any]) -> dict[str, Any]:
     if normalized["tile_size_fallback"] > normalized["tile_size_primary"]:
         normalized["tile_size_fallback"] = normalized["tile_size_primary"]
 
-    normalized["cache_root"] = _as_path(normalized.get("cache_root") or (PREDICTION_ROOT / "cache"))
+    normalized["cache_root"] = resolve_path(normalized.get("cache_root") or (PREDICTION_ROOT / "cache"))
     enable_cache = normalized.get("enable_cache")
     if enable_cache is not None:
         enable_cache = bool(enable_cache)
@@ -1379,7 +1278,7 @@ def normalize_runtime_job(job: dict[str, Any]) -> dict[str, Any]:
 
 
 def resolve_prediction_output_dir(default_path: str | Path) -> Path:
-    return _as_path(default_path)
+    return resolve_path(default_path)
 
 
 def resolve_default_inference_batch_size(device_name: str) -> int:
@@ -2485,14 +2384,11 @@ def run_projection_target(
     device_meta: dict[str, Any],
     model_members: list[dict[str, Any]],
     model_bundle_identity: dict[str, Any],
-    backend_adapter: dict[str, Any] | None,
     runtime_summary: dict[str, Any],
     grid_summary: dict[str, Any],
 ) -> dict[str, Any]:
     import_runtime_dependencies()
     download_only = bool(job.get("download_only", False))
-    if not download_only and backend_adapter is None:
-        raise RuntimeError("Inference mode requires a resolved model backend adapter.")
     output_path = raster_output_dir / target["output_name"]
     output_stem = output_path.stem
     uncertainty_enabled = bool(not download_only and should_write_uncertainty_outputs(job, model_members))
@@ -2875,8 +2771,6 @@ def run_projection_target(
                         )
                         save_progress_manifest(manifest_path, manifest)
                         progress_display.update_from_manifest(manifest)
-                        if backend_adapter is None:
-                            raise RuntimeError("Inference tile processing requires a model backend adapter.")
                         prediction_blocks, stats = predict_probability_block(
                             feature_array,
                             aoi_mask,
@@ -2885,7 +2779,6 @@ def run_projection_target(
                             device=device,
                             inference_batch_size=int(runtime_cfg["inference_batch_size"]),
                             nodata_value=float(profile["nodata"]),
-                            apply_feature_preparation=backend_adapter["apply_feature_preparation_artifact"],
                             uncertainty_metrics=uncertainty_export_metrics,
                             uncertainty_epsilon=float(job.get("uncertainty_epsilon", 1e-6) or 1e-6),
                         )
@@ -3059,7 +2952,6 @@ def run_projection_targets(
     targets: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     import_runtime_dependencies()
-    ee_ctx.get_runtime_context()
     region = ee_ctx.get_runtime_context()["region"]
     download_only = bool(job.get("download_only", False))
     job = normalize_runtime_job(job if download_only else finalize_train_config(job))
@@ -3068,7 +2960,6 @@ def run_projection_targets(
 
     runtime_cfg = dict(cfg)
     runtime_cfg["device"] = str(job.get("device") or "cpu")
-    backend_adapter = None
     if download_only:
         device = None
         device_meta = {
@@ -3083,13 +2974,13 @@ def run_projection_targets(
             "bundle_hash": "download_only",
         }
     else:
-        backend_adapter = ensure_inference_dependencies(job.get("model_backend"))
-        device = backend_adapter["resolve_torch_device"](runtime_cfg)
-        device_meta = backend_adapter["get_device_metadata"](runtime_cfg)
+        from cvrank.shared import get_device_metadata, resolve_torch_device
+
+        device = resolve_torch_device(runtime_cfg)
+        device_meta = get_device_metadata(runtime_cfg, resolved=device)
         runtime_cfg["inference_batch_size"] = resolve_inference_batch_size(job, device_meta)
         members_meta, fold_manifest_path = resolve_model_member_artifacts(
             cfg,
-            backend_adapter=backend_adapter,
         )
         model_bundle_identity = build_model_bundle_identity(
             train_config_path=job["train_config_path"],
@@ -3101,7 +2992,7 @@ def run_projection_targets(
             cfg,
             feature_cols,
             device,
-            backend_adapter=backend_adapter,
+
             members_meta=members_meta,
         )
         verify_model_bundle_unchanged(
@@ -3124,7 +3015,7 @@ def run_projection_targets(
     json_output_dir = resolve_json_output_dir(job, PREDICTION_ROOT / "outputs" / "json")
     raster_output_dir.mkdir(parents=True, exist_ok=True)
     json_output_dir.mkdir(parents=True, exist_ok=True)
-    cache_root = _as_path(job.get("cache_root", PREDICTION_ROOT / "cache"))
+    cache_root = resolve_path(job.get("cache_root", PREDICTION_ROOT / "cache"))
     cache_root.mkdir(parents=True, exist_ok=True)
 
     xmin, _ymin, _xmax, ymax, width, height = get_projected_grid(region)
@@ -3243,7 +3134,7 @@ def run_projection_targets(
             device_meta=device_meta,
             model_members=model_members,
             model_bundle_identity=model_bundle_identity,
-            backend_adapter=backend_adapter,
+
             runtime_summary=runtime_summary,
             grid_summary=grid_summary,
         )
