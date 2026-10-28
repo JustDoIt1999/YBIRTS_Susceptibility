@@ -80,10 +80,11 @@ def _build_cluster_aware_groups(
 
 def masked_bce_with_logits(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     mask = (targets != -1).float()
-    if mask.sum() <= 0:
+    count = mask.sum()
+    if count <= 0:
         return logits.new_tensor(0.0)
     loss = F.binary_cross_entropy_with_logits(logits, targets.clamp(min=0), reduction="none")
-    return (loss * mask).sum() / mask.sum()
+    return (loss * mask).sum() / count
 
 
 def _ideal_dcg(gains: torch.Tensor) -> torch.Tensor:
@@ -121,10 +122,9 @@ def ndcg_aware_lambdarank_loss(
         cluster_values,
         use_cluster_in_rank_loss=use_cluster_in_rank_loss,
     ):
-        group_scores = s_values[group_indices.tolist()]
-        group_rels = r_values[group_indices.tolist()]
-        if group_scores.numel() <= 1:
-            continue
+        indices = group_indices.tolist()
+        group_scores = s_values[indices]
+        group_rels = r_values[indices]
 
         order = torch.argsort(group_scores, descending=True)
         positions = torch.empty_like(order)

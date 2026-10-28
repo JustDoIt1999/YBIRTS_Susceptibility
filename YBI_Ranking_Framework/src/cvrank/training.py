@@ -10,46 +10,36 @@ import torch.optim as optim
 
 from .batch_size import get_batch_size_tag
 from .constants import DEFAULT_BATCH_SIZE, DEFAULT_GROUP_COL, DEFAULT_SEED, RANK_LOSS_MODE_DISABLED
-from .data_utils import save_feature_preparation_artifact, seed_everything
+from .data_utils import prepare_modeling_frame, save_feature_preparation_artifact, seed_everything
 from .losses import (
     compute_rank_loss,
     masked_bce_with_logits,
-    ndcg_aware_lambdarank_loss,
 )
 from .rank_loss_mode import resolve_effective_rank_loss_mode
 from .selection import get_lambda_rank
 from .shared import (
     PreparedSplit,
-    build_model as _build_model,
-    build_fold_training_config as _build_fold_training_config,
-    default_feature_preparation_path as _default_feature_preparation_path,
-    default_fold_runs_manifest_path as _default_fold_runs_manifest_path,
-    default_history_path as _default_history_path,
-    default_metrics_path as _default_metrics_path,
-    default_model_path as _default_model_path,
-    default_output_root as _default_output_root,
-    default_scaler_path as _default_scaler_path,
-    default_validation_metrics_path as _default_validation_metrics_path,
+    build_model,
+    build_fold_training_config,
+    default_feature_preparation_path,
+    default_fold_runs_manifest_path,
+    default_history_path,
+    default_metrics_path,
+    default_model_path,
+    default_output_root,
+    default_scaler_path,
+    default_validation_metrics_path,
     get_device_metadata,
-    has_split_manifest as _has_split_manifest,
-    load_fold_runs_manifest,
-    numeric_mean_std as _numeric_mean_std,
-    prepare_frame as _prepare_frame,
-    prepare_frame_details as _prepare_frame_details,
-    prepare_frame_metadata as _prepare_frame_metadata,
-    prepare_loaders as _prepare_loaders,
+    has_split_manifest,
+    numeric_mean_std,
+    prepare_loaders,
     resolve_torch_device,
-    resolve_split_from_config as _resolve_split_from_config,
+    resolve_split_from_config,
     save_json,
-    try_load_fold_runs_manifest as _try_load_fold_runs_manifest,
 )
 from .split import resolve_requested_fold_indices
 from .validation import collect_loader_outputs, compute_metrics_from_outputs, evaluate_loader, summarize_metric_dicts
 
-
-
-def _compat_epoch_eval_call(model, loader, device):  # noqa: ANN001
-    return evaluate_loader(model, loader, device, include_rank_metrics=False)
 
 
 def _format_lambda_rank_for_logging(lambda_rank: float, rank_aux_enabled: bool) -> str:
@@ -75,7 +65,7 @@ def _run_training_single_fold(
 
     loader_config = dict(config)
     loader_config["feature_preparation_artifact"] = feature_preparation_artifact
-    train_loader, eval_loader, scaler, _, _, _, _, _, fitted_feature_preparation = _prepare_loaders(
+    train_loader, eval_loader, scaler, _, _, _, _, _, fitted_feature_preparation = prepare_loaders(
         df,
         loader_config,
         feature_cols,
@@ -87,8 +77,8 @@ def _run_training_single_fold(
     )
 
     device = resolve_torch_device(config)
-    device_metadata = get_device_metadata(config)
-    model = _build_model(input_dim=len(feature_cols), config=config).to(device)
+    device_metadata = get_device_metadata(config, resolved=device)
+    model = build_model(input_dim=len(feature_cols), config=config).to(device)
     optimizer = optim.Adam(
         model.parameters(),
         lr=float(config.get("lr", 1e-3)),
@@ -161,7 +151,7 @@ def _run_training_single_fold(
             epoch_loss += float(loss.item())
             epoch_cls += float(loss_cls.item())
 
-        val_eval = _compat_epoch_eval_call(model, eval_loader, device)
+        val_eval = evaluate_loader(model, eval_loader, device)
 
         avg_loss = epoch_loss / max(len(train_loader), 1)
         avg_cls = epoch_cls / max(len(train_loader), 1)
@@ -207,16 +197,14 @@ def _run_training_single_fold(
     final_eval = compute_metrics_from_outputs(
         eval_outputs,
         threshold=threshold,
-        include_rank_metrics=rank_aux_enabled,
-        use_cluster_in_rank_loss=use_cluster_in_rank_loss,
     )
 
-    model_path = _default_model_path(config)
-    scaler_path = _default_scaler_path(config)
-    metrics_path = _default_metrics_path(config)
-    validation_metrics_path = _default_validation_metrics_path(config)
-    history_path = _default_history_path(config)
-    feature_preparation_path = _default_feature_preparation_path(config)
+    model_path = default_model_path(config)
+    scaler_path = default_scaler_path(config)
+    metrics_path = default_metrics_path(config)
+    validation_metrics_path = default_validation_metrics_path(config)
+    history_path = default_history_path(config)
+    feature_preparation_path = default_feature_preparation_path(config)
 
     for path in [model_path, scaler_path, metrics_path, validation_metrics_path, history_path, feature_preparation_path]:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -312,7 +300,7 @@ def _run_training_single_fold(
 
 
 def run_training(config: dict[str, Any]) -> dict[str, Any]:
-    prepared = _prepare_frame_details(config)
+    prepared = prepare_modeling_frame(config)
     df = prepared.frame
     route = prepared.route
     label_col = prepared.label_col
@@ -320,18 +308,18 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
     cluster_col = prepared.cluster_col
     year_col = prepared.year_col
     feature_cols = list(prepared.feature_cols)
-    prepared_metadata = _prepare_frame_metadata(prepared)
+    prepared_metadata = prepared.metadata()
     group_col = str(config.get("group_col", DEFAULT_GROUP_COL))
     requested_folds = resolve_requested_fold_indices(config, config.get("split_manifest_path"))
-    split_manifest_present = _has_split_manifest(config)
+    split_manifest_present = has_split_manifest(config)
 
     if split_manifest_present and requested_folds and len(requested_folds) > 1:
-        output_root = _default_output_root(config)
+        output_root = default_output_root(config)
         output_root.mkdir(parents=True, exist_ok=True)
-        metrics_path = _default_metrics_path(config)
-        validation_metrics_path = _default_validation_metrics_path(config)
-        history_path = _default_history_path(config)
-        fold_runs_manifest_path = _default_fold_runs_manifest_path(config)
+        metrics_path = default_metrics_path(config)
+        validation_metrics_path = default_validation_metrics_path(config)
+        history_path = default_history_path(config)
+        fold_runs_manifest_path = default_fold_runs_manifest_path(config)
 
         lambda_rank = get_lambda_rank(config)
         lambda_source = "lambda_rank" if "lambda_rank" in config else ("alpha" if "alpha" in config else "default")
@@ -352,8 +340,8 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
         fold_validation_metrics: list[dict[str, Any]] = []
         combined_history_rows: list[dict[str, Any]] = []
         for fold_index in requested_folds:
-            fold_config = _build_fold_training_config(config, route, fold_index)
-            split = _resolve_split_from_config(df, fold_config, group_col=group_col, label_col=label_col)
+            fold_config = build_fold_training_config(config, route, fold_index)
+            split = resolve_split_from_config(df, fold_config, group_col=group_col, label_col=label_col)
             result = _run_training_single_fold(
                 fold_config,
                 df,
@@ -433,8 +421,8 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
         save_json(fold_runs_manifest_path, fold_runs_manifest)
 
         best_eval_summary = summarize_metric_dicts([item["best_eval"] for item in fold_metrics])
-        best_epoch_mean, best_epoch_std = _numeric_mean_std([item["best_epoch"] for item in fold_metrics])
-        best_val_loss_mean, best_val_loss_std = _numeric_mean_std([item["best_val_loss_proxy"] for item in fold_metrics])
+        best_epoch_mean, best_epoch_std = numeric_mean_std([item["best_epoch"] for item in fold_metrics])
+        best_val_loss_mean, best_val_loss_std = numeric_mean_std([item["best_val_loss_proxy"] for item in fold_metrics])
 
         aggregate_metrics = {
             "route": route,
@@ -483,7 +471,7 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
     if requested_folds and len(requested_folds) == 1 and single_config.get("fold_index") is None:
         single_config["fold_index"] = int(requested_folds[0])
 
-    split = _resolve_split_from_config(df, single_config, group_col=group_col, label_col=label_col)
+    split = resolve_split_from_config(df, single_config, group_col=group_col, label_col=label_col)
     result = _run_training_single_fold(
         single_config,
         df,
@@ -500,29 +488,4 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
     return result["metrics"]
 
 
-__all__ = [
-    "PreparedSplit",
-    "_build_fold_training_config",
-    "_build_model",
-    "_default_feature_preparation_path",
-    "_default_fold_runs_manifest_path",
-    "_default_history_path",
-    "_default_metrics_path",
-    "_default_model_path",
-    "_default_output_root",
-    "_default_scaler_path",
-    "_default_validation_metrics_path",
-    "_has_split_manifest",
-    "_numeric_mean_std",
-    "_prepare_frame",
-    "_prepare_frame_details",
-    "_prepare_frame_metadata",
-    "_prepare_loaders",
-    "_resolve_split_from_config",
-    "_try_load_fold_runs_manifest",
-    "compute_rank_loss",
-    "load_fold_runs_manifest",
-    "masked_bce_with_logits",
-    "ndcg_aware_lambdarank_loss",
-    "run_training",
-]
+__all__ = ["run_training"]

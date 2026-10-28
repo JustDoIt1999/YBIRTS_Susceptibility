@@ -17,8 +17,8 @@ from torch.utils.data import Dataset
 
 from .batch_size import get_batch_size_tag, tag_directory_path, tag_name
 from .constants import DEFAULT_BATCH_SIZE, DEFAULT_GROUP_COL, DEFAULT_SEED
-from .data_utils import PreparedModelingFrame, attach_numeric_imputation_values, prepare_modeling_frame
-from .model import CVRankNetModel, normalize_batch_norm_mode, normalize_dropout_mode
+from .data_utils import attach_numeric_imputation_values
+from .model import CVRankNetModel, normalize_layer_mode
 from .split import load_fold_manifest_split, load_npz_split
 
 
@@ -78,16 +78,18 @@ def _select_auto_device() -> torch.device:
     return torch.device("cpu")
 
 
-def resolve_torch_device(config: dict[str, Any] | None = None) -> torch.device:
-    requested: str | None = None
+def _requested_device(config: dict[str, Any] | None) -> str:
     if isinstance(config, dict):
         raw_device = config.get("device")
         if raw_device not in (None, ""):
-            requested = normalize_device(raw_device)
-        elif "use_cuda" in config:
-            requested = "cuda" if bool(config.get("use_cuda", False)) else "cpu"
-    if requested is None:
-        requested = "cpu"
+            return normalize_device(raw_device)
+        if "use_cuda" in config:
+            return "cuda" if bool(config["use_cuda"]) else "cpu"
+    return "cpu"
+
+
+def resolve_torch_device(config: dict[str, Any] | None = None) -> torch.device:
+    requested = _requested_device(config)
 
     if requested == "auto":
         return _select_auto_device()
@@ -105,55 +107,17 @@ def resolve_torch_device(config: dict[str, Any] | None = None) -> torch.device:
     return torch.device("cpu")
 
 
-def get_device_metadata(config: dict[str, Any] | None = None) -> dict[str, str]:
-    resolved = resolve_torch_device(config)
-    requested = "cpu"
-    if isinstance(config, dict):
-        raw_device = config.get("device")
-        if raw_device not in (None, ""):
-            requested = normalize_device(raw_device)
-        elif "use_cuda" in config:
-            requested = "cuda" if bool(config.get("use_cuda", False)) else "cpu"
+def get_device_metadata(
+    config: dict[str, Any] | None = None,
+    *,
+    resolved: torch.device | None = None,
+) -> dict[str, str]:
+    if resolved is None:
+        resolved = resolve_torch_device(config)
     return {
-        "device_requested": requested,
+        "device_requested": _requested_device(config),
         "device_resolved": resolved.type,
     }
-
-
-def prepare_frame(config: dict[str, Any]) -> tuple[pd.DataFrame, str, str, str | None, str | None, str, list[str]]:
-    prepared = prepare_frame_details(config)
-    return (
-        prepared.frame,
-        prepared.route,
-        prepared.label_col,
-        prepared.rank_col,
-        prepared.cluster_col,
-        prepared.year_col,
-        list(prepared.feature_cols),
-    )
-
-
-def prepare_frame_details(
-    config: dict[str, Any],
-    *,
-    include_rank_in_required: bool | None = None,
-    feature_preparation_artifact: dict[str, Any] | None = None,
-    fill_numeric_imputation: bool = False,
-) -> PreparedModelingFrame:
-    return prepare_modeling_frame(
-        config,
-        include_rank_in_required=include_rank_in_required,
-        feature_preparation_artifact=feature_preparation_artifact,
-        fill_numeric_imputation=fill_numeric_imputation,
-    )
-
-
-def prepare_frame_metadata(prepared: PreparedModelingFrame) -> dict[str, Any]:
-    return prepared.metadata()
-
-
-def merge_prepared_metadata(payload: dict[str, Any], prepared: PreparedModelingFrame) -> dict[str, Any]:
-    return {**payload, **prepare_frame_metadata(prepared)}
 
 
 def resolve_split_from_config(
@@ -286,22 +250,6 @@ def build_fold_training_config(config: dict[str, Any], route: str, fold_index: i
     return fold_config
 
 
-def concat_output_batches(outputs_list: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
-    if not outputs_list:
-        return {
-            "y_prob": np.asarray([], dtype=float),
-            "y_true": np.asarray([], dtype=float),
-            "y_rank": np.asarray([], dtype=float),
-            "years": np.asarray([], dtype=float),
-            "clusters": np.asarray([], dtype=float),
-        }
-    keys = ["y_prob", "y_true", "y_rank", "years", "clusters"]
-    merged: dict[str, np.ndarray] = {}
-    for key in keys:
-        merged[key] = np.concatenate([np.asarray(item.get(key, []), dtype=float) for item in outputs_list]).astype(float)
-    return merged
-
-
 def numeric_mean_std(values: list[Any]) -> tuple[float, float]:
     arr = np.asarray(values, dtype=float)
     if arr.size == 0 or np.all(np.isnan(arr)):
@@ -314,14 +262,12 @@ def build_model(input_dim: int, config: dict[str, Any]) -> CVRankNetModel:
     if isinstance(hidden_dims, list):
         hidden_dims = tuple(int(v) for v in hidden_dims)
     dropout = float(config.get("dropout", 0.2))
-    dropout_mode = normalize_dropout_mode(config.get("dropout_mode", "all"))
-    batch_norm_mode = normalize_batch_norm_mode(config.get("batch_norm_mode", "all"))
     return CVRankNetModel(
         input_dim=input_dim,
         hidden_dims=hidden_dims,
         dropout=dropout,
-        dropout_mode=dropout_mode,
-        batch_norm_mode=batch_norm_mode,
+        dropout_mode=config.get("dropout_mode", "all"),
+        batch_norm_mode=config.get("batch_norm_mode", "all"),
     )
 
 
@@ -372,7 +318,7 @@ def prepare_loaders(
                 raise ValueError(f"Imputed feature `{feature_name}` not found in dataframe.")
             fill_value = meta.get("fill_value")
             if fill_value is None:
-                train_values = pd.to_numeric(working_df.iloc[train_idx][feature_name], errors="coerce")
+                train_values = pd.to_numeric(working_df[feature_name].iloc[train_idx], errors="coerce")
                 finite_values = train_values[np.isfinite(train_values)]
                 if finite_values.size == 0:
                     raise ValueError(f"Cannot fit median imputer for feature `{feature_name}`: no finite train values.")
@@ -393,7 +339,7 @@ def prepare_loaders(
     eval_ds = RTSTabularDataset(x_eval_scaled, y_cls[eval_idx], y_rank[eval_idx], years[eval_idx], clusters[eval_idx])
 
     requested_batch_size = int(config.get("batch_size", DEFAULT_BATCH_SIZE))
-    batch_norm_mode = normalize_batch_norm_mode(config.get("batch_norm_mode", "all"))
+    batch_norm_mode = normalize_layer_mode(config.get("batch_norm_mode", "all"), "batch norm")
     if len(train_ds) < 2 and batch_norm_mode != "none":
         raise ValueError("Training split is too small for an MLP that uses BatchNorm.")
     effective_batch_size = max(2, min(requested_batch_size, len(train_ds)))

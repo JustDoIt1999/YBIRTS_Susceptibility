@@ -8,7 +8,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import pandas as pd
 
@@ -34,7 +34,6 @@ from .training import run_training
 from .validation import run_validation, summarize_metric_dicts
 
 
-PipelineCallable = Callable[[dict[str, Any]], Any]
 
 
 RUNTIME_CONFIG_COMMANDS = {
@@ -731,8 +730,8 @@ def main() -> None:
         cfg = runner.resolve_runtime_overrides(
             cfg,
             batch_size=getattr(args, "batch_size", None),
-            rank_loss_mode=getattr(args, "rank_loss_mode", None) if hasattr(args, "rank_loss_mode") else None,
-            output_suffix=getattr(args, "output_suffix", None) if hasattr(args, "output_suffix") else None,
+            rank_loss_mode=getattr(args, "rank_loss_mode", None),
+            output_suffix=getattr(args, "output_suffix", None),
         )
 
         result = _run_command_handler(args, cfg, base_dir)

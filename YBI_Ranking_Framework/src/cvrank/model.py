@@ -1,22 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Iterable
 
 import torch
 from torch import nn
 
 
-@dataclass
-class MLPConfig:
-    input_dim: int
-    hidden_dims: tuple[int, ...] = (128, 64)
-    dropout: float = 0.2
-    dropout_mode: str = "all"
-    batch_norm_mode: str = "all"
-
-
-def normalize_batch_norm_mode(value: str | None) -> str:
+def normalize_layer_mode(value: str | None, layer_name: str) -> str:
     text = str(value or "all").strip().lower()
     aliases = {
         "all": "all",
@@ -32,46 +22,8 @@ def normalize_batch_norm_mode(value: str | None) -> str:
     }
     normalized = aliases.get(text)
     if normalized is None:
-        raise ValueError(f"Unsupported batch norm mode: {value!r}")
+        raise ValueError(f"Unsupported {layer_name} mode: {value!r}")
     return normalized
-
-
-def should_apply_batch_norm(batch_norm_mode: str, layer_index: int) -> bool:
-    normalized = normalize_batch_norm_mode(batch_norm_mode)
-    if normalized == "all":
-        return True
-    if normalized == "first":
-        return layer_index == 0
-    return False
-
-
-def normalize_dropout_mode(value: str | None) -> str:
-    text = str(value or "all").strip().lower()
-    aliases = {
-        "all": "all",
-        "each": "all",
-        "every": "all",
-        "first": "first",
-        "first_only": "first",
-        "1": "first",
-        "none": "none",
-        "off": "none",
-        "disabled": "none",
-        "0": "none",
-    }
-    normalized = aliases.get(text)
-    if normalized is None:
-        raise ValueError(f"Unsupported dropout mode: {value!r}")
-    return normalized
-
-
-def should_apply_dropout(dropout_mode: str, layer_index: int) -> bool:
-    normalized = normalize_dropout_mode(dropout_mode)
-    if normalized == "all":
-        return True
-    if normalized == "first":
-        return layer_index == 0
-    return False
 
 
 class MLPBackbone(nn.Module):
@@ -87,14 +39,14 @@ class MLPBackbone(nn.Module):
         hidden_dims = tuple(hidden_dims)
         dims = [input_dim, *hidden_dims]
         layers: list[nn.Module] = []
-        normalized_dropout_mode = normalize_dropout_mode(dropout_mode)
-        normalized_batch_norm_mode = normalize_batch_norm_mode(batch_norm_mode)
+        normalized_dropout_mode = normalize_layer_mode(dropout_mode, "dropout")
+        normalized_batch_norm_mode = normalize_layer_mode(batch_norm_mode, "batch norm")
         for layer_index, (left, right) in enumerate(zip(dims[:-1], dims[1:])):
             layers.append(nn.Linear(left, right))
-            if should_apply_batch_norm(normalized_batch_norm_mode, layer_index):
+            if normalized_batch_norm_mode == "all" or (normalized_batch_norm_mode == "first" and layer_index == 0):
                 layers.append(nn.BatchNorm1d(right))
             layers.append(nn.ReLU())
-            if float(dropout) > 0 and should_apply_dropout(normalized_dropout_mode, layer_index):
+            if float(dropout) > 0 and (normalized_dropout_mode == "all" or (normalized_dropout_mode == "first" and layer_index == 0)):
                 layers.append(nn.Dropout(dropout))
         self.backbone = nn.Sequential(*layers)
 

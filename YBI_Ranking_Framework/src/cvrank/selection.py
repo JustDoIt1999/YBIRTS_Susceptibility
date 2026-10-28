@@ -427,12 +427,6 @@ def build_final_training_config(
 _build_final_training_config = build_final_training_config
 
 
-def _series_float(series: pd.Series, key: str) -> float:
-    if key not in series.index:
-        return float("nan")
-    return to_float(series.get(key))
-
-
 def _series_metric(series: pd.Series, key: str) -> float:
     if key not in series.index:
         return float("nan")

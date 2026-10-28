@@ -12,24 +12,7 @@ WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
-from .constants import DEFAULT_BATCH_SIZE, DEFAULT_N_SPLITS, DEFAULT_SEED, FEATURE_COLS
-from .constants import RANK_LOSS_MODE_NDCG_AWARE_LAMBDARANK
-
-def _project_output_root(project_root: str | Path) -> Path:
-    return Path(project_root).resolve() / "data" / "output"
-
-
-def _environmental_outputs_root(workspace_root: str | Path) -> Path:
-    return Path(workspace_root).resolve() / "Dataset_Construction" / "outputs" / "03_environmental_data"
-
-
-def _training_table_path(workspace_root: str | Path, route: str) -> Path:
-    return _environmental_outputs_root(workspace_root) / "Total_features_sample.csv"
-
-
-def _resolve_feature_cols_for_route(route: str) -> list[str]:
-    return list(FEATURE_COLS)
-
+from .constants import FEATURE_COLS
 
 @dataclass(frozen=True)
 class RouteDefinition:
@@ -44,17 +27,6 @@ class RouteDefinition:
     use_cluster_in_rank_loss: bool
     feature_cols: tuple[str, ...]
 
-    @property
-    def output_root_name(self) -> str:
-        return f"data/output/output_{self.route}"
-
-    @property
-    def split_manifest_name(self) -> str:
-        return f"data/output/folds/{self.route}_5fold_manifest.csv"
-
-    @property
-    def fixed_split_name(self) -> str:
-        return f"data/output/folds/{self.route}_train_test_split.npz"
 
 ROUTE_REGISTRY: dict[str, RouteDefinition] = {
     "dbscan": RouteDefinition(
@@ -197,19 +169,6 @@ def resolve_path(value: str | Path | None, base_dir: str | Path | None = None) -
     return (root / path).resolve()
 
 
-def build_common_defaults(base_dir: str | Path | None = None) -> dict[str, Any]:
-    root = Path(base_dir or ".").resolve()
-    return {
-        "project_name": "cvrank",
-        "base_dir": str(root),
-        "seed": DEFAULT_SEED,
-        "n_splits": DEFAULT_N_SPLITS,
-        "group_col": "Sample_ID",
-        "stratify_mode": "year_plus_label",
-        "split_strategy": "stratified_group_kfold",
-    }
-
-
 def resolve_config_paths(config: dict[str, Any], base_dir: str | Path | None = None) -> dict[str, Any]:
     config_dir = Path(str(config.get("_config_dir") or ".")).resolve()
     root_candidate = Path(base_dir or config.get("base_dir") or ".")
@@ -252,7 +211,7 @@ def resolve_config_paths(config: dict[str, Any], base_dir: str | Path | None = N
         route = normalize_route(resolved.get("route"))
         route_def = get_route_definition(route)
         resolved["route"] = route
-        resolved["feature_cols"] = _resolve_feature_cols_for_route(route) or list(route_def.feature_cols)
+        resolved["feature_cols"] = list(route_def.feature_cols)
 
     if isinstance(resolved.get("route_config_paths"), list):
         resolved["route_config_paths"] = [
@@ -261,67 +220,3 @@ def resolve_config_paths(config: dict[str, Any], base_dir: str | Path | None = N
         ]
     validate_config_schema(resolved)
     return resolved
-
-
-def _build_paths(base_dir: str | Path | None = None, output_root_name: str | Path | None = None) -> dict[str, Path]:
-    root = Path(base_dir or ".").resolve()
-    if output_root_name is None:
-        output_root = root / get_route_definition("dbscan").output_root_name
-    else:
-        candidate = Path(output_root_name)
-        output_root = candidate if candidate.is_absolute() else (root / candidate).resolve()
-    return {
-        "base_dir": root,
-        "output_root": output_root,
-        "model_dir": output_root / "model",
-    }
-
-
-def _build_train_validate_config(route: str, base_dir: str | Path | None = None, output_root_name: str | Path | None = None) -> dict[str, Any]:
-    route = normalize_route(route)
-    route_def = get_route_definition(route)
-    root = Path(base_dir or ".").resolve()
-    output_root_name = output_root_name or (_project_output_root(root) / f"output_{route}").resolve()
-    paths = _build_paths(base_dir=root, output_root_name=output_root_name)
-    model_prefix = route
-    data_path = _training_table_path(root.parent, route)
-    split_manifest_path = _project_output_root(root) / "folds" / f"{route}_5fold_manifest.csv"
-    fixed_split_path = _project_output_root(root) / "folds" / f"{route}_train_test_split.npz"
-
-    config: dict[str, Any] = {
-        "project_name": "cvrank",
-        "route": route,
-        "task": "train_validate",
-        "base_dir": str(root),
-        "data_path": str(data_path),
-        "output_root": str(paths["output_root"]),
-        "model_path": str(paths["model_dir"] / f"{model_prefix}_model.pth"),
-        "scaler_path": str(paths["model_dir"] / f"{model_prefix}_scaler.pkl"),
-        "metrics_path": str(paths["model_dir"] / f"{model_prefix}_train_metrics.json"),
-        "validation_metrics_path": str(paths["model_dir"] / f"{model_prefix}_validation_metrics.json"),
-        "history_path": str(paths["model_dir"] / f"{model_prefix}_train_history.csv"),
-        "fold_runs_manifest_path": str(paths["output_root"] / "fold_runs_manifest.json"),
-        "split_manifest_path": str(split_manifest_path),
-        "fixed_split_path": str(fixed_split_path),
-        "seed": DEFAULT_SEED,
-        "epochs": 100,
-        "patience": 15,
-        "batch_size": DEFAULT_BATCH_SIZE,
-        "lr": 1e-3,
-        "weight_decay": 1e-5,
-        "lambda_rank": 1.0,
-        "rank_loss_mode": RANK_LOSS_MODE_NDCG_AWARE_LAMBDARANK,
-        "threshold": 0.5,
-        "n_splits": DEFAULT_N_SPLITS,
-        "group_col": "Sample_ID",
-        "year_col": route_def.year_col,
-        "label_col": route_def.label_col,
-        "rank_col": route_def.rank_col,
-        "cluster_col": route_def.cluster_col,
-        "stratify_mode": "year_plus_label",
-        "use_rank_aux": route_def.use_rank_aux,
-        "use_cluster_in_rank_loss": route_def.use_cluster_in_rank_loss,
-        "hidden_dims": [128, 64, 32],
-        "dropout": 0.2,
-    }
-    return config

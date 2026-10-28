@@ -24,14 +24,12 @@ from .shared import (
 )
 from .batch_size import get_batch_size_tag, tag_name
 from .constants import RANK_LOSS_MODE_DISABLED
-from .data_utils import load_feature_preparation_artifact
+from .data_utils import prepare_modeling_frame, load_feature_preparation_artifact
 from .rank_loss_mode import resolve_effective_rank_loss_mode
 from .shared import (
     build_model,
     get_device_metadata,
     has_split_manifest,
-    prepare_frame_details,
-    prepare_frame_metadata,
     prepare_loaders,
     resolve_torch_device,
     resolve_split_from_config,
@@ -53,14 +51,7 @@ def compute_binary_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold: fl
     y_true = np.asarray(y_true)[valid_mask]
     y_prob = np.asarray(y_prob)[valid_mask]
     if y_true.size == 0:
-        return {
-            "auc": float("nan"),
-            "f1": float("nan"),
-            "accuracy": float("nan"),
-            "kappa": float("nan"),
-            "precision": float("nan"),
-            "recall": float("nan"),
-        }
+        return dict(EMPTY_ROUTE_METRICS)
     y_pred = (y_prob >= threshold).astype(int)
     return {
         "auc": float(roc_auc_score(y_true, y_prob)) if np.unique(y_true).size >= 2 else float("nan"),
@@ -95,22 +86,6 @@ def summarize_metric_dicts(metric_dicts: list[dict[str, Any]]) -> dict[str, dict
     return {"mean": mean_values, "std": std_values}
 
 
-
-
-def compute_route_metrics(
-    y_true: np.ndarray,
-    y_prob: np.ndarray,
-    threshold: float = 0.5,
-    *,
-    y_rank: np.ndarray | None = None,
-    years: np.ndarray | None = None,
-    clusters: np.ndarray | None = None,
-    include_rank_metrics: bool = True,
-    use_cluster_in_rank_loss: bool = False,
-) -> dict[str, Any]:
-    y_true = np.asarray(y_true, dtype=float).reshape(-1)
-    y_prob = np.asarray(y_prob, dtype=float).reshape(-1)
-    return compute_binary_metrics(y_true, y_prob, threshold=threshold)
 
 
 def collect_loader_outputs(
@@ -158,26 +133,10 @@ def compute_metrics_from_outputs(
     outputs: dict[str, np.ndarray],
     *,
     threshold: float = 0.5,
-    include_rank_metrics: bool = True,
-    use_cluster_in_rank_loss: bool = False,
 ) -> dict[str, Any]:
-    y_prob = np.asarray(outputs.get("y_prob", []), dtype=float)
-    y_true = np.asarray(outputs.get("y_true", []), dtype=float)
-    y_rank = np.asarray(outputs.get("y_rank", []), dtype=float)
-    years = np.asarray(outputs.get("years", []), dtype=float)
-    clusters = np.asarray(outputs.get("clusters", []), dtype=float)
-    if y_prob.size == 0:
-        return dict(EMPTY_ROUTE_METRICS)
-    return compute_route_metrics(
-        y_true=y_true,
-        y_prob=y_prob,
-        threshold=threshold,
-        y_rank=y_rank,
-        years=years,
-        clusters=clusters,
-        include_rank_metrics=include_rank_metrics,
-        use_cluster_in_rank_loss=use_cluster_in_rank_loss,
-    )
+    y_prob = np.asarray(outputs["y_prob"], dtype=float).reshape(-1)
+    y_true = np.asarray(outputs["y_true"], dtype=float).reshape(-1)
+    return compute_binary_metrics(y_true, y_prob, threshold=threshold)
 
 
 def evaluate_loader(
@@ -186,15 +145,11 @@ def evaluate_loader(
     device: torch.device,
     *,
     threshold: float = 0.5,
-    include_rank_metrics: bool = True,
-    use_cluster_in_rank_loss: bool = False,
 ) -> dict[str, Any]:
     outputs = collect_loader_outputs(model, loader, device)
     return compute_metrics_from_outputs(
         outputs,
         threshold=threshold,
-        include_rank_metrics=include_rank_metrics,
-        use_cluster_in_rank_loss=use_cluster_in_rank_loss,
     )
 
 
@@ -234,7 +189,7 @@ def run_validation(config: dict[str, Any]) -> dict[str, Any]:
             resolved_feature_preparation_path
         )
 
-    prepared = prepare_frame_details(config, feature_preparation_artifact=base_feature_preparation)
+    prepared = prepare_modeling_frame(config, feature_preparation_artifact=base_feature_preparation)
     df = prepared.frame
     route = prepared.route
     label_col = prepared.label_col
@@ -242,12 +197,11 @@ def run_validation(config: dict[str, Any]) -> dict[str, Any]:
     cluster_col = prepared.cluster_col
     year_col = prepared.year_col
     feature_cols = list(prepared.feature_cols)
-    prepared_metadata = prepare_frame_metadata(prepared)
+    prepared_metadata = prepared.metadata()
     use_rank_aux = bool(prepared.rank_aux_effective) and rank_col is not None
     rank_loss_mode = resolve_effective_rank_loss_mode(config, use_rank_aux=use_rank_aux, rank_col=rank_col)
     rank_aux_effective = rank_loss_mode != RANK_LOSS_MODE_DISABLED and rank_col is not None
     threshold = float(config.get("threshold", 0.5))
-    use_cluster_in_rank_loss = bool(config.get("use_cluster_in_rank_loss", False))
     group_col = str(config.get("group_col", "Sample_ID"))
     batch_size_tag = get_batch_size_tag(config)
     validation_metrics_path = Path(
@@ -277,7 +231,7 @@ def run_validation(config: dict[str, Any]) -> dict[str, Any]:
             if fold_artifact is not None:
                 fold_config["feature_preparation_artifact"] = fold_artifact
             split = resolve_split_from_config(df, fold_config, group_col=group_col, label_col=label_col)
-            prepared_for_member = prepare_frame_details(
+            prepared_for_member = prepare_modeling_frame(
                 config,
                 feature_preparation_artifact=fold_artifact,
                 fill_numeric_imputation=fold_artifact is not None,
@@ -315,8 +269,6 @@ def run_validation(config: dict[str, Any]) -> dict[str, Any]:
             metrics = compute_metrics_from_outputs(
                 outputs,
                 threshold=threshold,
-                include_rank_metrics=rank_aux_effective,
-                use_cluster_in_rank_loss=use_cluster_in_rank_loss,
             )
             fold_metrics.append(
                 {
@@ -384,7 +336,7 @@ def run_validation(config: dict[str, Any]) -> dict[str, Any]:
             "feature_preparation_path": str(base_feature_preparation_path) if base_feature_preparation_path is not None else None,
             **prepared_metadata,
             "rank_aux_effective": rank_aux_effective,
-            **get_device_metadata(config),
+            **get_device_metadata(config, resolved=device),
         }
     else:
         single_config = dict(config)
@@ -425,8 +377,6 @@ def run_validation(config: dict[str, Any]) -> dict[str, Any]:
             eval_loader,
             device,
             threshold=threshold,
-            include_rank_metrics=rank_aux_effective,
-            use_cluster_in_rank_loss=use_cluster_in_rank_loss,
         )
         payload = {
             "route": route,
@@ -448,7 +398,7 @@ def run_validation(config: dict[str, Any]) -> dict[str, Any]:
             "feature_preparation_path": str(base_feature_preparation_path) if base_feature_preparation_path is not None else None,
             **prepared_metadata,
             "rank_aux_effective": rank_aux_effective,
-            **get_device_metadata(config),
+            **get_device_metadata(config, resolved=device),
         }
 
     with validation_metrics_path.open("w", encoding="utf-8") as fh:
@@ -462,7 +412,6 @@ __all__ = [
     "collect_loader_outputs",
     "compute_binary_metrics",
     "compute_metrics_from_outputs",
-    "compute_route_metrics",
     "evaluate_loader",
     "run_validation",
     "summarize_metric_dicts",

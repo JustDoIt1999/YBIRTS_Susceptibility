@@ -56,8 +56,7 @@ def make_stratified_group_folds(
     splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
     artifacts: list[FoldArtifacts] = []
 
-    for fold_index, (_, val_idx) in enumerate(splitter.split(prepared, stratify_key, groups)):
-        train_idx = np.setdiff1d(np.arange(len(prepared)), val_idx, assume_unique=False)
+    for fold_index, (train_idx, val_idx) in enumerate(splitter.split(prepared, stratify_key, groups)):
         artifacts.append(
             FoldArtifacts(
                 fold_index=fold_index,
@@ -87,32 +86,17 @@ def build_fold_manifest(
         label_col=label_col,
     )
 
-    rows: list[dict[str, object]] = []
+    parts: list[pd.DataFrame] = []
+    columns = [group_col, year_col, label_col]
     for fold in folds:
-        for idx in fold.train_rows:
-            rows.append(
-                {
-                    "fold": fold.fold_index,
-                    "split": "train",
-                    "row_index": int(prepared.index[int(idx)]),
-                    group_col: prepared.iloc[idx][group_col],
-                    year_col: prepared.iloc[idx][year_col],
-                    label_col: prepared.iloc[idx][label_col],
-                }
-            )
-        for idx in fold.val_rows:
-            rows.append(
-                {
-                    "fold": fold.fold_index,
-                    "split": "val",
-                    "row_index": int(prepared.index[int(idx)]),
-                    group_col: prepared.iloc[idx][group_col],
-                    year_col: prepared.iloc[idx][year_col],
-                    label_col: prepared.iloc[idx][label_col],
-                }
-            )
+        for split_name, indices in (("train", fold.train_rows), ("val", fold.val_rows)):
+            part = prepared.iloc[indices][columns].copy()
+            part.insert(0, "row_index", part.index.to_numpy(dtype=int))
+            part.insert(0, "split", split_name)
+            part.insert(0, "fold", fold.fold_index)
+            parts.append(part)
 
-    return pd.DataFrame(rows)
+    return pd.concat(parts, ignore_index=True)
 
 
 def build_fold_manifest_from_config(config: dict[str, Any]) -> FoldManifestBuildResult:

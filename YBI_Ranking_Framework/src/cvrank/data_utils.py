@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 import copy
+import json
 import os
 import random
 import warnings
@@ -124,11 +125,7 @@ def prepare_dataframe(
 
 
 def resolve_feature_columns(route: str, df: pd.DataFrame | None = None) -> list[str]:
-    return [col for col in FEATURE_COLS if df is None or col in df.columns] if df is not None else list(FEATURE_COLS)
-
-
-def coerce_label(series: pd.Series) -> pd.Series:
-    return pd.to_numeric(series, errors="coerce")
+    return list(FEATURE_COLS) if df is None else [col for col in FEATURE_COLS if col in df.columns]
 
 
 def _normalize_route(route: Any) -> str:
@@ -142,17 +139,13 @@ def _resolve_label_col(route: str, config: dict[str, Any], df: pd.DataFrame) -> 
     return label_col
 
 
-def _default_use_rank_aux(route: str) -> bool:
-    return True
-
-
 def _resolve_rank_input(
     route: str,
     config: dict[str, Any],
     df: pd.DataFrame,
     label_col: str,
 ) -> tuple[str | None, str, bool, list[str]]:
-    requested_use_rank_aux = bool(config.get("use_rank_aux", _default_use_rank_aux(route)))
+    requested_use_rank_aux = bool(config.get("use_rank_aux", True))
     if not requested_use_rank_aux or get_rank_loss_mode(config) == RANK_LOSS_MODE_DISABLED:
         return None, "disabled", False, []
 
@@ -335,14 +328,14 @@ def _resolve_feature_preparation_artifact(
 def load_feature_preparation_artifact(path: str | Path) -> dict[str, Any]:
     artifact_path = Path(path)
     with artifact_path.open("r", encoding="utf-8") as fh:
-        return json_load(fh.read())
+        return json.load(fh)
 
 
 def save_feature_preparation_artifact(path: str | Path, artifact: dict[str, Any]) -> Path:
     artifact_path = Path(path)
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     with artifact_path.open("w", encoding="utf-8") as fh:
-        json_dump(artifact, fh)
+        json.dump(artifact, fh, ensure_ascii=False, indent=2, default=str)
     return artifact_path
 
 
@@ -356,22 +349,6 @@ def attach_numeric_imputation_values(
             continue
         updated["numeric_imputation"][feature_name]["fill_value"] = float(fill_value)
     return updated
-
-
-def _serialize_jsonable(payload: dict[str, Any]) -> str:
-    import json
-
-    return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
-
-
-def json_dump(payload: dict[str, Any], fh: Any) -> None:
-    fh.write(_serialize_jsonable(payload))
-
-
-def json_load(text: str) -> dict[str, Any]:
-    import json
-
-    return json.loads(text)
 
 
 def apply_feature_preparation_artifact(
@@ -437,24 +414,6 @@ def apply_feature_preparation_artifact(
         missing_required_raw_na_mask,
         missing_required_input_nodata_mask,
     )
-
-
-def apply_numeric_imputation_to_frame(
-    frame: pd.DataFrame,
-    artifact: dict[str, Any],
-) -> pd.DataFrame:
-    updated = frame.copy()
-    for feature_name, meta in artifact.get("numeric_imputation", {}).items():
-        fill_value = meta.get("fill_value")
-        if fill_value is None or not np.isfinite(fill_value):
-            raise ValueError(f"Missing fitted imputation value for feature `{feature_name}`.")
-        if feature_name not in updated.columns:
-            raise ValueError(f"Imputed feature `{feature_name}` not found in frame.")
-        updated[feature_name] = pd.to_numeric(updated[feature_name], errors="coerce").fillna(float(fill_value))
-        indicator_col = str(meta["missing_indicator_col"])
-        if indicator_col in updated.columns:
-            updated[indicator_col] = pd.to_numeric(updated[indicator_col], errors="coerce").fillna(0.0)
-    return updated
 
 
 def prepare_modeling_frame(
