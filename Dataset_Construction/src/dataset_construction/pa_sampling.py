@@ -92,10 +92,11 @@ def geometry_random_points(geometry, n: int, rng: np.random.Generator) -> np.nda
 
 
 
-def filter_by_min_distance(candidates: np.ndarray, references: np.ndarray, min_distance: float) -> np.ndarray:
-    if len(candidates) == 0 or min_distance <= 0 or len(references) == 0:
+def filter_by_min_distance(candidates: np.ndarray, references: np.ndarray | cKDTree, min_distance: float) -> np.ndarray:
+    reference_count = references.n if isinstance(references, cKDTree) else len(references)
+    if len(candidates) == 0 or min_distance <= 0 or reference_count == 0:
         return candidates
-    tree = cKDTree(references)
+    tree = references if isinstance(references, cKDTree) else cKDTree(references)
     nearest_dist, _ = tree.query(candidates, k=1)
     return candidates[nearest_dist >= min_distance]
 
@@ -136,12 +137,13 @@ def sample_pa_one_year(
     passes = 0
     accepted_chunks: list[np.ndarray] = []
     local_accum = accum_coords.copy()
+    presence_tree = cKDTree(presence_coords) if min_sep_presence_m > 0 and len(presence_coords) else presence_coords
 
     while remain > 0 and passes < max_passes:
         passes += 1
         batch_size = max(1, min(int(remain * batch_factor), 10000))
         cand = geometry_random_points(geometry, batch_size, rng)
-        cand = filter_by_min_distance(cand, presence_coords, min_sep_presence_m)
+        cand = filter_by_min_distance(cand, presence_tree, min_sep_presence_m)
         cand = filter_by_min_distance(cand, local_accum, min_sep_pa_m)
         cand = drop_close_pairs(cand, min_sep_pa_m)
         if len(cand) == 0:

@@ -26,7 +26,3 @@ def resolve_dataset_construction_root(
 
 def python_output_root(root: Path) -> Path:
     return root / "outputs"
-
-
-def notebook_root(root: Path) -> Path:
-    return root / "Jupyter_notebook"

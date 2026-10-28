@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from IPython.display import display
 
@@ -130,7 +131,6 @@ if qc_summary["pseudo_absence_cluster_zero_rows"] != qc_summary["pseudo_absence_
 if qc_summary["pseudo_absence_basin_cluster_zero_rows"] != qc_summary["pseudo_absence_rows"]:
     raise AssertionError("Not every pseudo-absence row has `Basin_cluster=0`.")
 
-total_sample_df.head()
 
 # ## Export
 
@@ -155,40 +155,24 @@ print({
     "feature_year_max": FEATURE_YEAR_MAX,
 })
 
-def assign_labels(row: pd.Series) -> tuple[int, int]:
-    if row["Label"] == NEGATIVE_LABEL:
-        return 0, 0
-
-    ttf = int(row["Occurrence_Year"] - row["Feature_Year"])
-    if ttf == 0:
-        return 1, 5
-    if 1 <= ttf <= RANK_LOOKBACK_YEARS:
-        return -1, 5 - ttf
-    return 0, 0
-
-
 rank_input_df = total_sample_df.rename(columns={"Year": "Occurrence_Year"}).copy()
-expanded_rows = []
-
-for row in rank_input_df.to_dict(orient="records"):
-    if int(row["Label"]) == POSITIVE_LABEL:
-        for offset in range(RANK_LOOKBACK_YEARS + 1):
-            new_row = row.copy()
-            new_row["Feature_Year"] = int(row["Occurrence_Year"]) - offset
-            expanded_rows.append(new_row)
-    else:
-        new_row = row.copy()
-        new_row["Feature_Year"] = int(row["Occurrence_Year"])
-        expanded_rows.append(new_row)
-
-rank_sample_df = pd.DataFrame(expanded_rows)
+repeat_counts = np.where(rank_input_df["Label"].eq(POSITIVE_LABEL), RANK_LOOKBACK_YEARS + 1, 1)
+rank_sample_df = rank_input_df.loc[rank_input_df.index.repeat(repeat_counts)].copy()
+offsets = np.arange(len(rank_sample_df)) - np.repeat(np.cumsum(repeat_counts) - repeat_counts, repeat_counts)
+rank_sample_df["Feature_Year"] = rank_sample_df["Occurrence_Year"].to_numpy() - offsets
+rank_sample_df = rank_sample_df.reset_index(drop=True)
 
 if CLIP_FEATURE_YEAR_TO_OBSERVED_RANGE:
     rank_sample_df = rank_sample_df.loc[
         rank_sample_df["Feature_Year"].between(FEATURE_YEAR_MIN, FEATURE_YEAR_MAX)
     ].copy()
 
-rank_sample_df["Label_Cls"], rank_sample_df["Label_Rank"] = zip(*rank_sample_df.apply(assign_labels, axis=1))
+years_before_initiation = rank_sample_df["Occurrence_Year"] - rank_sample_df["Feature_Year"]
+positive_mask = rank_sample_df["Label"].eq(POSITIVE_LABEL)
+initiation_mask = positive_mask & years_before_initiation.eq(0)
+lookback_mask = positive_mask & years_before_initiation.between(1, RANK_LOOKBACK_YEARS)
+rank_sample_df["Label_Cls"] = np.select([initiation_mask, lookback_mask], [1, -1], default=0)
+rank_sample_df["Label_Rank"] = np.where(positive_mask, 5 - years_before_initiation, 0)
 rank_sample_df["Occurrence_Year"] = rank_sample_df["Occurrence_Year"].astype(int)
 rank_sample_df["Feature_Year"] = rank_sample_df["Feature_Year"].astype(int)
 rank_sample_df["Label"] = rank_sample_df["Label"].astype(int)
@@ -215,7 +199,6 @@ rank_sample_df = rank_sample_df[rank_ordered_cols].sort_values(
     ascending=[True, False, True, True],
 ).reset_index(drop=True)
 
-rank_sample_df.head(10)
 
 # ## Rank QC And Export
 
