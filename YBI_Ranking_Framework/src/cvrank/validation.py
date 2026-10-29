@@ -245,7 +245,7 @@ def run_validation(config: dict[str, Any]) -> dict[str, Any]:
                 )
             if not current_df.index.equals(df.index):
                 raise ValueError(f"Fold {fold_index} prepared validation rows do not align with base frame.")
-            _, eval_loader, _, _, _, _, _, _, _ = prepare_loaders(
+            _, eval_loader, _, _ = prepare_loaders(
                 df,
                 fold_config,
                 feature_cols,
@@ -352,7 +352,7 @@ def run_validation(config: dict[str, Any]) -> dict[str, Any]:
                     "Configured feature preparation artifact does not match prepared validation frame: "
                     f"{expected_feature_cols} != {feature_cols}"
                 )
-        _, eval_loader, _, _, _, _, _, _, _ = prepare_loaders(
+        _, eval_loader, _, _ = prepare_loaders(
             df,
             single_config,
             feature_cols,

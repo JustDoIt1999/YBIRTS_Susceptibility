@@ -4,24 +4,10 @@ import re
 from pathlib import Path
 from typing import Any
 
+from .output_paths import OUTPUT_DIRECTORY_KEYS, OUTPUT_FILE_KEYS
 
 OUTPUT_SUFFIX_KEY = "output_suffix"
 
-_DIRECTORY_KEYS = {
-    "output_root",
-    "output_dir",
-}
-_FILE_KEYS = {
-    "model_path",
-    "scaler_path",
-    "metrics_path",
-    "validation_metrics_path",
-    "history_path",
-    "fold_runs_manifest_path",
-    "runs_csv",
-    "summary_csv",
-    "run_config_path",
-}
 _SUFFIX_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 _GLOBAL_COMPONENT_NAMES = {
     "selected_lambda",
@@ -110,7 +96,7 @@ def apply_output_suffix_path_tagging(config: dict[str, Any]) -> dict[str, Any]:
         return tagged
 
     component_names = _component_names_for_config(tagged)
-    for key in _DIRECTORY_KEYS | _FILE_KEYS:
+    for key in OUTPUT_DIRECTORY_KEYS | OUTPUT_FILE_KEYS:
         value = tagged.get(key)
         if not isinstance(value, (str, Path)) or not str(value).strip():
             continue

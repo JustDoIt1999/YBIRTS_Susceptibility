@@ -8,6 +8,11 @@ from .constants import (
     RANK_LOSS_MODE_DISABLED,
     RANK_LOSS_MODE_NDCG_AWARE_LAMBDARANK,
 )
+from .output_paths import (
+    OUTPUT_DIRECTORY_KEYS as _DIRECTORY_KEYS,
+    OUTPUT_FILE_KEYS as _FILE_KEYS,
+    rewrite_under_root,
+)
 
 
 RANK_LOSS_MODE_KEY = "rank_loss_mode"
@@ -25,23 +30,6 @@ _ALIASES = {
     "none": RANK_LOSS_MODE_DISABLED,
     "off": RANK_LOSS_MODE_DISABLED,
 }
-
-_DIRECTORY_KEYS = {
-    "output_root",
-    "output_dir",
-}
-_FILE_KEYS = {
-    "model_path",
-    "scaler_path",
-    "metrics_path",
-    "validation_metrics_path",
-    "history_path",
-    "fold_runs_manifest_path",
-    "runs_csv",
-    "summary_csv",
-    "run_config_path",
-}
-
 
 def normalize_rank_loss_mode(value: Any) -> str:
     text = str(value or "").strip().lower()
@@ -91,22 +79,6 @@ def tag_rank_loss_mode_file_parent(path: str | Path, config: dict[str, Any] | No
     return tag_directory_path(base.parent, tag) / base.name
 
 
-def _is_relative_to(path: Path, parent: Path | None) -> bool:
-    if parent is None:
-        return False
-    try:
-        path.relative_to(parent)
-        return True
-    except ValueError:
-        return False
-
-
-def _rewrite_under_root(path: Path, old_root: Path | None, new_root: Path | None) -> tuple[Path, bool]:
-    if old_root is None or new_root is None or not _is_relative_to(path, old_root):
-        return path, False
-    return new_root / path.relative_to(old_root), True
-
-
 def apply_rank_loss_mode_override(config: dict[str, Any], requested_mode: Any | None) -> dict[str, Any]:
     updated = dict(config)
     if requested_mode is not None:
@@ -135,7 +107,7 @@ def apply_rank_loss_mode_path_tagging(config: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(value, (str, Path)) or not str(value).strip():
             continue
         path = Path(value)
-        rewritten, changed = _rewrite_under_root(path, old_output_root, new_output_root)
+        rewritten, changed = rewrite_under_root(path, old_output_root, new_output_root)
         if changed:
             tagged[key] = str(rewritten)
 
@@ -144,7 +116,7 @@ def apply_rank_loss_mode_path_tagging(config: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(value, (str, Path)) or not str(value).strip():
             continue
         path = Path(value)
-        rewritten, changed = _rewrite_under_root(path, old_output_root, new_output_root)
+        rewritten, changed = rewrite_under_root(path, old_output_root, new_output_root)
         if changed:
             tagged[key] = str(rewritten)
 

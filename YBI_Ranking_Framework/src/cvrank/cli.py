@@ -5,7 +5,6 @@ import json
 import platform
 import shutil
 import sys
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -86,28 +85,18 @@ def save_run_metadata(base_dir: str | Path, command: str, payload: dict[str, Any
     return path
 
 
-@dataclass
-class PipelineRunner:
-    command: str
-    apply_batch_size_tagging: bool = True
-    apply_rank_loss_override: bool = True
-
-    def resolve_runtime_overrides(
-        self,
-        config: dict[str, Any],
-        *,
-        batch_size: int | None = None,
-        rank_loss_mode: str | None = None,
-        output_suffix: str | None = None,
-    ) -> dict[str, Any]:
-        resolved = apply_output_suffix_override(config, output_suffix)
-        resolved = apply_batch_size_override(resolved, batch_size)
-        if self.apply_rank_loss_override:
-            resolved = apply_rank_loss_mode_override(resolved, rank_loss_mode)
-        resolved = apply_output_suffix_path_tagging(resolved)
-        if self.apply_batch_size_tagging:
-            resolved = apply_batch_size_path_tagging(resolved)
-        return resolved
+def resolve_runtime_overrides(
+    config: dict[str, Any],
+    *,
+    batch_size: int | None = None,
+    rank_loss_mode: str | None = None,
+    output_suffix: str | None = None,
+) -> dict[str, Any]:
+    resolved = apply_output_suffix_override(config, output_suffix)
+    resolved = apply_batch_size_override(resolved, batch_size)
+    resolved = apply_rank_loss_mode_override(resolved, rank_loss_mode)
+    resolved = apply_output_suffix_path_tagging(resolved)
+    return apply_batch_size_path_tagging(resolved)
 
 
 def _add_config_arg(parser: argparse.ArgumentParser) -> None:
@@ -726,8 +715,7 @@ def main() -> None:
     if args.command in RUNTIME_CONFIG_COMMANDS:
         cfg = _load_resolved_config_from_args(args)
         base_dir = Path(cfg.get("base_dir", ".")).resolve()
-        runner = PipelineRunner(command=args.command)
-        cfg = runner.resolve_runtime_overrides(
+        cfg = resolve_runtime_overrides(
             cfg,
             batch_size=getattr(args, "batch_size", None),
             rank_loss_mode=getattr(args, "rank_loss_mode", None),

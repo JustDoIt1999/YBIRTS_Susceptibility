@@ -65,7 +65,7 @@ def _run_training_single_fold(
 
     loader_config = dict(config)
     loader_config["feature_preparation_artifact"] = feature_preparation_artifact
-    train_loader, eval_loader, scaler, _, _, _, _, _, fitted_feature_preparation = prepare_loaders(
+    train_loader, eval_loader, scaler, fitted_feature_preparation = prepare_loaders(
         df,
         loader_config,
         feature_cols,

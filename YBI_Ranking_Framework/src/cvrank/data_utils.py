@@ -132,7 +132,7 @@ def _normalize_route(route: Any) -> str:
     return str(route or "dbscan").strip().lower()
 
 
-def _resolve_label_col(route: str, config: dict[str, Any], df: pd.DataFrame) -> str:
+def _resolve_label_col(config: dict[str, Any], df: pd.DataFrame) -> str:
     label_col = str(config.get("label_col", DEFAULT_LABEL_COL))
     if label_col not in df.columns:
         raise ValueError(f"Label column `{label_col}` not found in data.")
@@ -143,7 +143,6 @@ def _resolve_rank_input(
     route: str,
     config: dict[str, Any],
     df: pd.DataFrame,
-    label_col: str,
 ) -> tuple[str | None, str, bool, list[str]]:
     requested_use_rank_aux = bool(config.get("use_rank_aux", True))
     if not requested_use_rank_aux or get_rank_loss_mode(config) == RANK_LOSS_MODE_DISABLED:
@@ -160,7 +159,7 @@ def _resolve_rank_input(
     return None, "missing_degraded", False, [message]
 
 
-def _resolve_group_col(route: str, config: dict[str, Any], df: pd.DataFrame) -> str:
+def _resolve_group_col(config: dict[str, Any], df: pd.DataFrame) -> str:
     group_col = str(config.get("group_col", DEFAULT_GROUP_COL))
     if group_col not in df.columns:
         raise ValueError(f"Group column `{group_col}` not found in data.")
@@ -427,12 +426,12 @@ def prepare_modeling_frame(
     route = _normalize_route(config.get("route", "dbscan"))
     source = load_table(config["data_path"]) if df is None else df.copy()
 
-    label_col = _resolve_label_col(route, config, source)
-    group_col = _resolve_group_col(route, config, source)
+    label_col = _resolve_label_col(config, source)
+    group_col = _resolve_group_col(config, source)
     year_col = str(config.get("year_col", DEFAULT_YEAR_COL))
     if year_col not in source.columns:
         raise ValueError(f"Year column `{year_col}` not found in data.")
-    rank_col, rank_input_status, rank_aux_effective, warning_messages = _resolve_rank_input(route, config, source, label_col)
+    rank_col, rank_input_status, rank_aux_effective, warning_messages = _resolve_rank_input(route, config, source)
     if include_rank_in_required is None:
         include_rank = rank_aux_effective
     else:

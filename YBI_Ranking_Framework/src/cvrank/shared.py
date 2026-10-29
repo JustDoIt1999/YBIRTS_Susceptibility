@@ -280,7 +280,7 @@ def prepare_loaders(
     cluster_col: str | None,
     year_col: str,
     split: PreparedSplit,
-) -> tuple[DataLoader, DataLoader, StandardScaler, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any] | None]:
+) -> tuple[DataLoader, DataLoader, StandardScaler, dict[str, Any] | None]:
     y_cls = df[label_col].fillna(-1).to_numpy(dtype=float)
     y_rank = df[rank_col].fillna(0).to_numpy(dtype=float) if rank_col is not None else np.zeros(len(df), dtype=float)
     years = df[year_col].to_numpy(dtype=float) if year_col in df.columns else np.zeros(len(df), dtype=float)
@@ -346,7 +346,7 @@ def prepare_loaders(
     drop_last = len(train_ds) > effective_batch_size and (len(train_ds) % effective_batch_size == 1)
     train_loader = DataLoader(train_ds, batch_size=effective_batch_size, shuffle=True, drop_last=drop_last)
     eval_loader = DataLoader(eval_ds, batch_size=max(1, min(effective_batch_size, len(eval_ds))), shuffle=False)
-    return train_loader, eval_loader, scaler, y_cls, y_rank, years, clusters, x, fitted_feature_preparation
+    return train_loader, eval_loader, scaler, fitted_feature_preparation
 
 
 def has_split_manifest(config: dict[str, Any]) -> bool:

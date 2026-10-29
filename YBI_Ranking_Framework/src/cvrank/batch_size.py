@@ -3,27 +3,17 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from .output_paths import (
+    OUTPUT_DIRECTORY_KEYS as _DIRECTORY_KEYS,
+    OUTPUT_FILE_KEYS as _FILE_KEYS,
+    rewrite_under_root,
+)
 
 BATCH_SIZE_TAG_KEY = "batch_size_tag"
 BATCH_SIZE_SOURCE_KEY = "batch_size_source"
 BATCH_SIZE_SOURCE_CONFIG = "config"
 BATCH_SIZE_SOURCE_CLI_OVERRIDE = "cli_override"
 
-_DIRECTORY_KEYS = {
-    "output_root",
-    "output_dir",
-}
-_FILE_KEYS = {
-    "model_path",
-    "scaler_path",
-    "metrics_path",
-    "validation_metrics_path",
-    "history_path",
-    "fold_runs_manifest_path",
-    "runs_csv",
-    "summary_csv",
-    "run_config_path",
-}
 _NAME_ONLY_KEYS = {
     "distribution_filename",
     "pr_roc_filename",
@@ -138,22 +128,6 @@ def apply_batch_size_override(config: dict[str, Any], requested_batch_size: Any 
     return updated
 
 
-def _is_relative_to(path: Path, parent: Path | None) -> bool:
-    if parent is None:
-        return False
-    try:
-        path.relative_to(parent)
-        return True
-    except ValueError:
-        return False
-
-
-def _rewrite_under_root(path: Path, old_root: Path | None, new_root: Path | None) -> tuple[Path, bool]:
-    if old_root is None or new_root is None or not _is_relative_to(path, old_root):
-        return path, False
-    return new_root / path.relative_to(old_root), True
-
-
 def apply_batch_size_path_tagging(config: dict[str, Any]) -> dict[str, Any]:
     tagged = dict(config)
     batch_size_tag = get_batch_size_tag(tagged)
@@ -171,7 +145,7 @@ def apply_batch_size_path_tagging(config: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(value, (str, Path)) or not str(value).strip():
             continue
         path = Path(value)
-        rewritten, changed = _rewrite_under_root(path, old_output_root, new_output_root)
+        rewritten, changed = rewrite_under_root(path, old_output_root, new_output_root)
         if not changed:
             rewritten = tag_directory_path(path, batch_size_tag)
         tagged[key] = str(rewritten)
@@ -181,7 +155,7 @@ def apply_batch_size_path_tagging(config: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(value, (str, Path)) or not str(value).strip():
             continue
         path = Path(value)
-        rewritten, changed = _rewrite_under_root(path, old_output_root, new_output_root)
+        rewritten, changed = rewrite_under_root(path, old_output_root, new_output_root)
 
         if not changed:
             rewritten = tag_directory_path(path.parent, batch_size_tag) / tag_file_path(path.name, batch_size_tag)

@@ -10,12 +10,11 @@ import pandas as pd
 import yaml
 
 from .batch_size import get_batch_size_tag, merge_batch_size_metadata, tag_name
-from .config import load_yaml_config, resolve_config_paths, resolve_path
+from .config import load_yaml_config, resolve_config_paths, resolve_grouping_rank_loss_mode, resolve_path
 from .constants import DEFAULT_LAMBDA_SWEEP_GRID, RANK_LOSS_MODE_DISABLED
 from .rank_loss_mode import (
     apply_rank_loss_mode_override,
     apply_rank_loss_mode_path_tagging,
-    get_explicit_rank_loss_mode,
     get_rank_loss_mode,
     merge_rank_loss_mode_metadata,
 )
@@ -31,11 +30,9 @@ from .run_fingerprint import (
     describe_file,
 )
 from .shared import default_feature_preparation_path
+from .output_paths import lambda_label
 from .training import run_training
 
-
-def _resolve_route_config(route_cfg_path: Path) -> dict[str, Any]:
-    return resolve_config_paths(load_yaml_config(route_cfg_path))
 
 ALLOWED_SWEEP_ROUTES = {"dbscan", "no_cluster", "basin"}
 RUN_IDENTITY_COLUMNS = [
@@ -45,36 +42,6 @@ RUN_IDENTITY_COLUMNS = [
     "fold_index",
     "batch_size_tag",
 ]
-
-
-def _resolve_sweep_grouping_rank_loss_mode(
-    config: dict[str, Any],
-    route_config_paths: list[Any],
-    base_dir: Path,
-) -> str | None:
-    explicit_mode = get_explicit_rank_loss_mode(config)
-    if explicit_mode is not None:
-        return explicit_mode
-
-    route_modes: set[str] = set()
-    for route_cfg_path_raw in route_config_paths:
-        route_cfg_path = resolve_path(route_cfg_path_raw, base_dir=base_dir)
-        if route_cfg_path is None or not route_cfg_path.exists():
-            continue
-        route_cfg = _resolve_route_config(route_cfg_path)
-        route_cfg = merge_rank_loss_mode_metadata(route_cfg, config)
-        route_modes.add(get_rank_loss_mode(route_cfg))
-        if len(route_modes) > 1:
-            return None
-
-    return next(iter(route_modes)) if len(route_modes) == 1 else None
-
-
-def _lambda_label(value: Any) -> str:
-    text = str(value).strip()
-    if text.endswith(".0"):
-        text = text[:-2]
-    return text.replace(".", "p")
 
 
 def _flatten_run_result(route: str, lambda_rank: float, fold_index: int, result: dict[str, Any], run_dir: Path) -> dict[str, Any]:
@@ -128,7 +95,7 @@ def _empty_run_row() -> dict[str, Any]:
     return {column: None for column in _empty_runs_frame().columns}
 
 
-def _dedupe_lambda_grid(values: list[Any]) -> tuple[list[float], list[float]]:
+def _dedupe_lambda_grid(values: list[Any]) -> tuple[list[float], list[float], list[float]]:
     raw_values = [float(value) for value in values]
     deduped: list[float] = []
     dropped: list[float] = []
@@ -339,10 +306,10 @@ def _build_run_config(
     fold_index: int,
 ) -> tuple[dict[str, Any], Path]:
     batch_size_tag = get_batch_size_tag(base_config)
-    lambda_dir = f"lambda_{_lambda_label(lambda_rank)}"
+    lambda_dir = f"lambda_{lambda_label(lambda_rank)}"
     run_dir = sweep_root / route / lambda_dir / f"fold_{fold_index}"
     model_dir = run_dir / "model"
-    prefix = f"{route}_lambda_{_lambda_label(lambda_rank)}_fold_{fold_index}"
+    prefix = f"{route}_lambda_{lambda_label(lambda_rank)}_fold_{fold_index}"
     tagged_prefix = tag_name(prefix, batch_size_tag) if batch_size_tag else prefix
 
     run_config = deepcopy(base_config)
@@ -367,7 +334,7 @@ def run_lambda_sweep(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("`route_config_paths` must be a non-empty list of route config paths.")
 
     path_tagging_config = dict(config)
-    grouping_rank_loss_mode = _resolve_sweep_grouping_rank_loss_mode(config, route_config_paths, base_dir)
+    grouping_rank_loss_mode = resolve_grouping_rank_loss_mode(config, base_dir)
     if grouping_rank_loss_mode is not None:
         path_tagging_config["rank_loss_mode"] = grouping_rank_loss_mode
     path_tagging_config = apply_rank_loss_mode_path_tagging(path_tagging_config)
@@ -402,7 +369,7 @@ def run_lambda_sweep(config: dict[str, Any]) -> dict[str, Any]:
         route_cfg_path = resolve_path(route_cfg_path, base_dir=base_dir)
         if route_cfg_path is None:
             raise ValueError("Invalid route config path in sweep config.")
-        route_cfg = _resolve_route_config(route_cfg_path)
+        route_cfg = resolve_config_paths(load_yaml_config(route_cfg_path))
         route_cfg = merge_batch_size_metadata(route_cfg, config)
         route_cfg = merge_rank_loss_mode_metadata(route_cfg, config)
         route_cfg = apply_rank_loss_mode_override(route_cfg, None)

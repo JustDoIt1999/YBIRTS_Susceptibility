@@ -13,6 +13,7 @@ if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
 from .constants import FEATURE_COLS
+from .rank_loss_mode import get_explicit_rank_loss_mode, get_rank_loss_mode, merge_rank_loss_mode_metadata
 
 @dataclass(frozen=True)
 class RouteDefinition:
@@ -220,3 +221,27 @@ def resolve_config_paths(config: dict[str, Any], base_dir: str | Path | None = N
         ]
     validate_config_schema(resolved)
     return resolved
+
+
+def resolve_grouping_rank_loss_mode(config: dict[str, Any], base_dir: Path) -> str | None:
+    """Use an explicit mode, or the common mode of the available route configs."""
+    explicit_mode = get_explicit_rank_loss_mode(config)
+    if explicit_mode is not None:
+        return explicit_mode
+
+    route_config_paths = config.get("route_config_paths")
+    if not isinstance(route_config_paths, list) or not route_config_paths:
+        return None
+
+    route_modes: set[str] = set()
+    for route_cfg_path_raw in route_config_paths:
+        route_cfg_path = resolve_path(route_cfg_path_raw, base_dir=base_dir)
+        if route_cfg_path is None or not route_cfg_path.exists():
+            continue
+        route_cfg = resolve_config_paths(load_yaml_config(route_cfg_path))
+        route_cfg = merge_rank_loss_mode_metadata(route_cfg, config)
+        route_modes.add(get_rank_loss_mode(route_cfg))
+        if len(route_modes) > 1:
+            return None
+
+    return next(iter(route_modes)) if len(route_modes) == 1 else None

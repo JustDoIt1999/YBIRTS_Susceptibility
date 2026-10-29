@@ -21,12 +21,12 @@ from .batch_size import (
     make_batch_size_tag,
     merge_batch_size_metadata,
 )
-from .config import load_yaml_config, resolve_config_paths, resolve_path
+from .config import load_yaml_config, resolve_config_paths, resolve_grouping_rank_loss_mode, resolve_path
 from .output_suffix import get_output_suffix
+from .output_paths import lambda_label
 from .rank_loss_mode import (
     SUPPORTED_RANK_LOSS_MODES,
     apply_rank_loss_mode_override,
-    get_explicit_rank_loss_mode,
     get_rank_loss_mode,
     merge_rank_loss_mode_metadata,
     normalize_rank_loss_mode,
@@ -34,10 +34,6 @@ from .rank_loss_mode import (
     tag_rank_loss_mode_file_parent,
 )
 from .constants import RANK_LOSS_MODE_DISABLED
-
-
-def _resolve_route_config(route_cfg_path: Path) -> dict[str, Any]:
-    return resolve_config_paths(load_yaml_config(route_cfg_path))
 
 
 ALLOWED_SELECTION_ROUTES = {"dbscan", "no_cluster", "basin"}
@@ -60,7 +56,6 @@ SELECTION_BASE_REQUIRED_COLUMNS = [
     "accuracy_mean",
 ]
 OPTIONAL_RANK_SORT_COLUMN = "pairwise_rank_accuracy_mean"
-SELECTION_STRATEGY_S1 = "s1"
 SELECTION_STRATEGY_S2 = "s2"
 SELECTION_POLICY = "s2_first_adaptive_s1_fallback"
 CLASSIFICATION_BASELINE_POLICY = "classification_baseline"
@@ -218,23 +213,6 @@ def _resolve_nonzero_candidates(candidate: pd.DataFrame) -> pd.DataFrame:
     return candidate[candidate["lambda_rank"] != 0].copy()
 
 
-def _select_s1_candidate(candidate: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
-    baseline = resolve_zero_lambda_baseline(candidate)
-    nonzero_candidate = _resolve_nonzero_candidates(candidate)
-    eligible = candidate.copy()
-    filtered = candidate.iloc[0:0].copy()
-    metadata = _build_selection_metadata(
-        SELECTION_STRATEGY_S1,
-        baseline,
-        candidate,
-        nonzero_candidate,
-        eligible,
-        filtered,
-        SELECTION_FILTER_TYPE_NONE,
-    )
-    return eligible, metadata
-
-
 def _select_s2_candidate(candidate: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
     baseline = resolve_zero_lambda_baseline(candidate)
     nonzero_candidate = _resolve_nonzero_candidates(candidate)
@@ -270,16 +248,11 @@ def pick_top_candidate_with_metadata(
     metadata["selection_fallback_used"] = False
     if eligible.empty:
         print("[Selection] S2 matched no eligible nonzero lambda. Adaptive fallback to S1...")
-        eligible, fallback_metadata = _select_s1_candidate(cleaned)
+        eligible = cleaned
         metadata["selection_stage_actual"] = "s1_fallback"
         metadata["selection_fallback_used"] = True
-        metadata["fallback_eligible_candidate_count"] = int(fallback_metadata["eligible_candidate_count"])
-        metadata["fallback_filtered_candidate_count"] = int(fallback_metadata["filtered_candidate_count"])
-
-    if eligible.empty:
-        baseline = resolve_zero_lambda_baseline(cleaned)
-        metadata["selection_used_lambda_zero_fallback"] = True
-        return baseline, list(SELECTION_SORT_COLUMNS), list(SELECTION_SORT_ASCENDING), metadata
+        metadata["fallback_eligible_candidate_count"] = int(len(cleaned))
+        metadata["fallback_filtered_candidate_count"] = 0
 
     ranked, sort_columns, sort_ascending = sort_candidate_frame(eligible)
     best_lambda_rank = float(ranked.iloc[0]["lambda_rank"])
@@ -325,13 +298,6 @@ def pick_top_candidate(
 ) -> tuple[pd.Series, list[str], list[bool]]:
     best_row, sort_columns, sort_ascending, _metadata = pick_top_candidate_with_metadata(frame)
     return best_row, sort_columns, sort_ascending
-
-
-def lambda_label(value: Any) -> str:
-    text = str(value).strip()
-    if text.endswith(".0"):
-        text = text[:-2]
-    return text.replace(".", "p")
 
 
 def selection_workspace_root(selection_output_root: Path) -> Path:
@@ -433,29 +399,6 @@ def _series_metric(series: pd.Series, key: str) -> float:
     return round_metric_value(series.get(key))
 
 
-def _resolve_selection_grouping_rank_loss_mode(config: dict[str, Any], base_dir: Path) -> str | None:
-    explicit_mode = get_explicit_rank_loss_mode(config)
-    if explicit_mode is not None:
-        return explicit_mode
-
-    route_config_paths = config.get("route_config_paths")
-    if not isinstance(route_config_paths, list) or not route_config_paths:
-        return None
-
-    route_modes: set[str] = set()
-    for route_cfg_path_raw in route_config_paths:
-        route_cfg_path = resolve_path(route_cfg_path_raw, base_dir=base_dir)
-        if route_cfg_path is None or not route_cfg_path.exists():
-            continue
-        route_cfg = _resolve_route_config(route_cfg_path)
-        route_cfg = merge_rank_loss_mode_metadata(route_cfg, config)
-        route_modes.add(get_rank_loss_mode(route_cfg))
-        if len(route_modes) > 1:
-            return None
-
-    return next(iter(route_modes)) if len(route_modes) == 1 else None
-
-
 def _require_summary_columns(summary_df: pd.DataFrame) -> None:
     ensure_required_columns(summary_df, sorted(required_summary_columns()))
     rank_loss_modes = summary_df["rank_loss_mode"].dropna().astype(str).str.strip().unique().tolist()
@@ -489,7 +432,7 @@ def run_lambda_selection(config: dict[str, Any]) -> dict[str, Any]:
     config[SELECTION_POLICY_KEY] = SELECTION_POLICY
     base_dir = Path(config.get("base_dir", ".")).resolve()
     path_tagging_config = dict(config)
-    grouping_rank_loss_mode = _resolve_selection_grouping_rank_loss_mode(config, base_dir)
+    grouping_rank_loss_mode = resolve_grouping_rank_loss_mode(config, base_dir)
     if grouping_rank_loss_mode is not None:
         path_tagging_config["rank_loss_mode"] = grouping_rank_loss_mode
     summary_csv = resolve_path(config.get("summary_csv"), base_dir=base_dir)
@@ -525,7 +468,7 @@ def run_lambda_selection(config: dict[str, Any]) -> dict[str, Any]:
         if not route_cfg_path.exists():
             raise FileNotFoundError(f"Route config not found: {route_cfg_path}")
 
-        route_cfg = _resolve_route_config(route_cfg_path)
+        route_cfg = resolve_config_paths(load_yaml_config(route_cfg_path))
         route_cfg = merge_batch_size_metadata(route_cfg, config)
         route_cfg = merge_rank_loss_mode_metadata(route_cfg, config)
         route_cfg = apply_rank_loss_mode_override(route_cfg, None)
